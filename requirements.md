@@ -58,7 +58,11 @@ Plays all `.mp3` files found on an SD card in a loop. WS2812B 30-LED spectrum an
 - Library calls `fclose()` on the FILE* when done — caller must not close it
 - `espressif/esp-dsp` (1.7.1) for 512-point FFT: `dsps_fft2r_init_fc32`, `dsps_fft2r_fc32`, `dsps_bit_rev2r_fc32`, `dsps_wind_hann_f32`
 - PCM tap in `i2s_write_cb`: stereo int16 downmixed to mono float, pushed to `xStreamBuffer`
-- LED task on core 0 (priority 3): reads FFT_SIZE floats, applies Hann window, FFT, log-compress, asymmetric smooth, beat detection, HSV render
+- LED task on core 0 (priority 3): reads FFT_SIZE floats, applies Hann window, FFT, global auto-gain, log-compress, asymmetric smooth (attack α=0.65, decay α=0.22), beat detection, HSV render
+- Colors: all 30 hues evenly distributed across 360°, Fisher-Yates shuffled on every beat (disco effect)
+- Beat detection: bass energy spike (≥1.5× rolling avg) OR spectral flux spike (≥1.8× rolling avg)
+- Fast warmup gain (×0.96/frame) for first 150 frames of each track — fills spectrum within first 1–2 beats
+- Global auto-gain (single running_max) preserves natural dynamics — decay α=0.22 keeps LEDs breathing with rhythm
 - Audio decode task pinned to core 1 (priority 5)
 - KEY1/GPIO36 unusable — input-only, no internal pull-up; KEY2/GPIO13 unusable — SD conflict
 - KEY3 (GPIO19) and KEY4 (GPIO23) confirmed working: active LOW, internal pull-up, 40 ms debounce
