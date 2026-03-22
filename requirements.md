@@ -9,20 +9,14 @@
 
 ## Project Type
 
-Select one and remove the others:
-
 - Embedded firmware — follow `/workspace/skills/embedded-project-setup.md` for working conventions, folder structure, knowledge flow, and build workflow.
-- Python application — follow `/workspace/skills/python-project-setup.md` for working conventions, folder structure, and tooling.
-- Web application — follow `/workspace/skills/web-project-setup.md` for working conventions, folder structure, and tooling.
 
 ---
 
 ## Hardware
 
-*(Embedded projects only — remove this section for other project types.)*
-
-**Board:** <!-- e.g. Waveshare ESP32-S3-Touch-LCD-1.9 -->
-**Full config:** `/workspace/knowledge/<board-file>.md`
+**Board:** Ai-Thinker ESP32-Audio-Kit (ESP32-A1S V2.3, ES8388 codec)
+**Full config:** `/workspace/knowledge/esp32-audio-kit-a1s.md`
 
 ---
 

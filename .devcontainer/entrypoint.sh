@@ -54,6 +54,19 @@ if [ "$(id -u)" = "0" ]; then
     fi
   fi
 
+  # Ensure the user's local bin directory is on PATH.
+  # Claude Code's native install lives at /home/ubuntu/.local/bin/claude, and we want it
+  # to take precedence over any system/npm-global installation.
+  mkdir -p /home/ubuntu/.local/bin
+  chown -R ubuntu:ubuntu /home/ubuntu/.local || true
+  export PATH="/home/ubuntu/.local/bin:${PATH}"
+  if [ ! -f /etc/profile.d/00-ubuntu-local-bin.sh ]; then
+    cat > /etc/profile.d/00-ubuntu-local-bin.sh <<'EOF'
+export PATH="/home/ubuntu/.local/bin:${PATH}"
+EOF
+    chmod 0644 /etc/profile.d/00-ubuntu-local-bin.sh || true
+  fi
+
   # Re-exec as the non-root user while preserving argv.
   # NOTE: `su -c` does not reliably preserve argv boundaries; it also drops the
   # first argument when used with `bash -c`, which breaks commands like

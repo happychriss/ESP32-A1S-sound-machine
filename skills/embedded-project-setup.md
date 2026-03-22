@@ -77,9 +77,10 @@ When the user adds a file to `external-docs/`:
 ## 4. ESP-IDF Build Conventions
 
 ### Environment
-- ESP-IDF v5.4.1 at `/opt/esp/esp-idf`
+- ESP-IDF v5.5.3 at `/opt/esp/esp-idf`
 - Activate: `source /opt/esp/esp-idf/export.sh`
-- Target: `esp32s3`
+- **Current target: `esp32`** (ESP32-Audio-Kit / ESP32-A1S)
+- Note: must chain source + idf.py in one shell: `bash -c "source /opt/esp/esp-idf/export.sh && idf.py build"`
 
 ### New Project Checklist
 - [ ] `main/idf_component.yml` — declare registry dependencies
@@ -87,11 +88,22 @@ When the user adds a file to `external-docs/`:
 - [ ] `main/CMakeLists.txt` REQUIRES — use `log` not `esp_log`
 - [ ] Clean before target change: `rm -rf build managed_components sdkconfig`
 
-### Flashing
-`idf.py flash` fails on USB-CDC — always use esptool with `--before=usb_reset`:
+### Flashing — ESP32 (Audio-Kit, USB-UART bridge)
+Standard DTR/RTS reset works — no `usb_reset` needed. Bootloader at **0x1000** (not 0x0):
 ```bash
 source /opt/esp/esp-idf/export.sh
-python3 -m esptool --chip esp32s3 -p /dev/ttyESP -b 460800 \
+python -m esptool --chip esp32 -p /dev/ttyESP -b 460800 \
+  --before default_reset --after hard_reset write_flash \
+  --flash_mode dio --flash_freq 40m --flash_size detect \
+  0x1000  build/bootloader/bootloader.bin \
+  0x8000  build/partition_table/partition-table.bin \
+  0x10000 build/<project>.bin
+```
+
+### Flashing — ESP32-S3 (USB-CDC, for reference)
+`idf.py flash` fails on USB-CDC — use esptool with `--before=usb_reset`. Bootloader at **0x0**:
+```bash
+python -m esptool --chip esp32s3 -p /dev/ttyESP -b 460800 \
   --before=usb_reset --after=hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size detect \
   0x0  build/bootloader/bootloader.bin \
