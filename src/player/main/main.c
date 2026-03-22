@@ -2,13 +2,13 @@
  * ESP32-Audio-Kit MP3 player + WS2812B LED mood show
  *
  * SD card → MP3 decode (chmorgan/esp-audio-player) → ES8388 → speaker
- * LED show (GPIO22, 30 LEDs) — mood-driven, not spectrum:
- *   - Beat phase drives brightness: full flash at beat, exponential decay to dark
- *   - Spectral centroid drives colour: bass-heavy → warm (red/orange),
- *     treble-bright → cool (blue/violet) — changes slowly with song character
- *   - RMS energy sets ambient floor: quiet passages dim, loud passages glow
- *   - On each beat: hues reshuffled in a spread around current centroid colour
- *   - Beat white-flash (saturation drops to near-zero at beat moment)
+ * LED show (GPIO22, 30 LEDs) — 4-layer composited mood show:
+ *   Layer 1 ambient:  slow palette rotation across all LEDs, speed tracks BPM
+ *   Layer 2 beat:     white flash on each beat, exponential decay (additive)
+ *   Layer 3 bass:     warm Gaussian blob drifts along strip driven by sub-bass
+ *   Layer 4 sparkle:  individual LEDs sparked by upper-band energy
+ *   Section detector: cosine novelty between band vectors cycles palette on
+ *                     verse/chorus transitions. Per-band AGC + global RMS gate.
  *
  * Keys (active LOW):
  *   KEY1  GPIO36 = Pause / Resume (input-only pin, external pull-up on board)
@@ -80,27 +80,53 @@ static const char *TAG = "player";
 #define VOL_STEP         8            /* volume change per press (0–100 scale)   */
 #define VOL_INIT        70
 
-/* ---------- FFT / LED mood show parameters ---------- */
-#define FFT_SIZE            512
+/* ---------- FFT / LED show parameters ---------- */
+#define FFT_SIZE              512
 /* stream buffer holds 8 FFT-blocks worth of mono float samples */
-#define STREAM_BUF_BYTES    (FFT_SIZE * 8 * sizeof(float))
+#define STREAM_BUF_BYTES      (FFT_SIZE * 8 * sizeof(float))
 
-/* spectral centroid → mood hue mapping */
-#define CENTROID_LO_HZ      300.0f  /* below this = full bass → hue 0 (red)  */
-#define CENTROID_HI_HZ     5000.0f  /* above this = full treble → hue HUE_RANGE */
-#define HUE_RANGE           240.0f  /* red (0°) → blue/violet (240°)          */
-#define HUE_SPREAD          160.0f  /* hue arc spread around centroid per beat */
+/* 8 logarithmic frequency bands */
+#define NUM_BANDS             8
+static const float BAND_HZ[NUM_BANDS + 1] = {
+    60.0f, 200.0f, 400.0f, 800.0f, 2000.0f, 4000.0f, 8000.0f, 14000.0f, 20000.0f
+};
 
-/* beat-phase brightness */
-#define BEAT_DECAY_K          5.0f  /* higher = darker between beats (more blinky) */
-#define AMBIENT_FACTOR        0.20f /* max ambient brightness from RMS energy   */
-#define FLASH_SAT_MIN         0.08f /* saturation at beat moment (near-white)   */
+/* Per-band AGC — exponential peak decay (~10 s at ~86 FPS update rate) */
+#define BAND_AGC_DECAY        0.9997f
+#define BAND_AGC_MIN          0.0001f
 
-/* beat detection */
-#define BEAT_RATIO            1.5f  /* bass energy spike: rolling avg × this    */
-#define BEAT_FLUX_RATIO       1.8f  /* spectral flux spike: rolling avg × this  */
-#define BEAT_MIN_GAP_MS       220   /* minimum ms between beats (~273 BPM max)  */
-#define BEAT_PERIOD_INIT_MS   550   /* starting estimate ~109 BPM               */
+/* Beat detection — spectral flux with stddev-adaptive threshold */
+#define BEAT_K                1.2f   /* lower = more responsive to clear kick  */
+#define BEAT_MIN_GAP_MS       220    /* ~273 BPM max                           */
+#define BEAT_PERIOD_INIT_MS   500    /* starting estimate ~120 BPM (pop tempo) */
+
+/* Section change — cosine novelty between band energy vectors */
+#define NOVELTY_K             2.0f   /* threshold = novelty_mean + K × std   */
+#define NOVELTY_SMOOTH        0.003f /* smooth_vec α — time constant ~4 s    */
+#define NOVELTY_MIN_GAP_MS    5000   /* minimum 5 s between section changes  */
+
+/* Layer strengths */
+#define AMBIENT_BASE          0.12f  /* dim ambient — keep dark between beats */
+#define BEAT_FLASH_PEAK       0.95f  /* beat-pulse additive white brightness  */
+#define BEAT_DECAY_K          9.0f   /* high = very dark between beats        */
+#define BASS_WAVE_PEAK        0.85f  /* bass blob peak brightness             */
+#define SPARKLE_THRESHOLD     0.45f  /* upper-band norm to trigger a sparkle  */
+#define SPARKLE_DECAY         0.88f  /* sparkle brightness × per frame        */
+#define MAX_SPARKLES          8      /* simultaneous sparkle slots            */
+
+/* Colour palettes: hue_start° and hue_range° (HSV, 0–360) */
+#define NUM_PALETTES          5
+typedef struct { float start; float range; } palette_t;
+static const palette_t PALETTES[NUM_PALETTES] = {
+    {  0.0f,  80.0f },   /* fire:    red → orange → yellow  */
+    {180.0f,  80.0f },   /* ocean:   cyan → blue            */
+    { 90.0f,  70.0f },   /* forest:  yellow-green           */
+    {270.0f, 100.0f },   /* neon:    violet → magenta       */
+    {  0.0f, 360.0f },   /* rainbow: full spectrum          */
+};
+
+/* Sparkle slot */
+typedef struct { uint8_t pos; float hue; float bright; } sparkle_t;
 
 /* ---------- globals ---------- */
 static i2s_chan_handle_t        s_i2s_tx;
@@ -150,19 +176,8 @@ static void hsv_to_rgb(float h, float s, float v,
     *b = (uint8_t)((b1 + m) * 255.0f);
 }
 
-/* Spread LED_COUNT hues evenly across HUE_SPREAD degrees centred on hue_base,
- * then Fisher-Yates shuffle — every LED gets a distinct hue in the mood palette. */
-static void shuffle_hues_mood(float *hues, float hue_base)
-{
-    float start = hue_base - HUE_SPREAD / 2.0f;
-    for (int i = 0; i < LED_COUNT; i++) {
-        hues[i] = fmodf(start + (HUE_SPREAD / (LED_COUNT - 1)) * i + 360.0f, 360.0f);
-    }
-    for (int i = LED_COUNT - 1; i > 0; i--) {
-        int j = (int)(esp_random() % (i + 1));
-        float tmp = hues[i]; hues[i] = hues[j]; hues[j] = tmp;
-    }
-}
+/* Additive blend clamped to [0, 255] */
+static inline uint8_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
 
 /* ------------------------------------------------------------------ */
 /*  LED show task — runs on core 0                                      */
@@ -170,161 +185,258 @@ static void shuffle_hues_mood(float *hues, float hue_base)
 
 static void led_task(void *arg)
 {
-    /* Work buffers in BSS */
-    static float fft_buf[FFT_SIZE * 2];      /* complex interleaved          */
-    static float pcm_buf[FFT_SIZE];
-    static float hann[FFT_SIZE];
-    static float prev_mag[FFT_SIZE / 2];     /* for spectral flux            */
-    static float led_hue[LED_COUNT];         /* hue per LED, mood-shuffled   */
+    /* ---- BSS work buffers ---- */
+    static float     fft_buf[FFT_SIZE * 2];
+    static float     pcm_buf[FFT_SIZE];
+    static float     hann_win[FFT_SIZE];
+    static float     prev_mag[FFT_SIZE / 2];
+    static float     band_energy[NUM_BANDS];
+    static float     band_peak[NUM_BANDS];
+    static float     band_norm[NUM_BANDS];
+    static float     smooth_vec[NUM_BANDS];   /* slow reference for novelty   */
+    static sparkle_t sparkles[MAX_SPARKLES];
+    static uint8_t   r_buf[LED_COUNT], g_buf[LED_COUNT], b_buf[LED_COUNT];
 
     ESP_ERROR_CHECK(dsps_fft2r_init_fc32(NULL, FFT_SIZE));
-    dsps_wind_hann_f32(hann, FFT_SIZE);
+    dsps_wind_hann_f32(hann_win, FFT_SIZE);
 
-    /* Start with a neutral mid-spectrum mood (green-ish) */
-    float centroid_norm  = 0.5f;
-    shuffle_hues_mood(led_hue, centroid_norm * HUE_RANGE);
+    for (int i = 0; i < NUM_BANDS; i++) band_peak[i] = BAND_AGC_MIN;
+    memset(band_energy, 0, sizeof(band_energy));
+    memset(band_norm,   0, sizeof(band_norm));
+    memset(smooth_vec,  0, sizeof(smooth_vec));
+    memset(sparkles,    0, sizeof(sparkles));
+    memset(prev_mag,    0, sizeof(prev_mag));
 
-    float      rms_display    = 0.0f;
-    float      rms_max        = 0.001f;
-    float      bass_avg       = 0.0f;
-    float      flux_avg       = 0.0f;
+    /* Beat */
+    float      flux_mean      = 0.0f;
+    float      flux_m2        = 0.0f;
+    float      beat_strength  = 0.0f;
     uint32_t   beat_period_ms = BEAT_PERIOD_INIT_MS;
     TickType_t last_beat_tick = 0;
-    memset(prev_mag, 0, sizeof(prev_mag));
+
+    /* Global RMS / brightness gate */
+    float global_peak  = 0.001f;
+    float global_rms_s = 0.0f;   /* smoothed RMS */
+
+    /* Section / palette */
+    float      novelty_mean  = 0.0f;
+    float      novelty_m2    = 0.0f;
+    TickType_t last_sec_tick = 0;
+    int        palette_idx   = 0;
+    float      hue_offset    = 0.0f;   /* ambient layer rotation */
+    float      wave_pos      = 0.0f;   /* bass blob position     */
 
     while (1) {
 
-        /* New track → reset all state */
+        /* ---- New track: full state reset ---- */
         if (s_track_started) {
-            s_track_started  = false;
-            centroid_norm    = 0.5f;
-            rms_display      = 0.0f;
-            rms_max          = 0.001f;
-            bass_avg         = 0.0f;
-            flux_avg         = 0.0f;
-            beat_period_ms   = BEAT_PERIOD_INIT_MS;
-            last_beat_tick   = xTaskGetTickCount();
+            s_track_started = false;
+            for (int i = 0; i < NUM_BANDS; i++) {
+                band_peak[i]  = BAND_AGC_MIN;
+                band_norm[i]  = 0.0f;
+                smooth_vec[i] = 0.0f;
+            }
             memset(prev_mag, 0, sizeof(prev_mag));
-            shuffle_hues_mood(led_hue, centroid_norm * HUE_RANGE);
+            memset(sparkles, 0, sizeof(sparkles));
+            flux_mean = 0.0f; flux_m2 = 0.0f;
+            beat_strength  = 0.0f;
+            beat_period_ms = BEAT_PERIOD_INIT_MS;
+            last_beat_tick = xTaskGetTickCount();
+            global_peak    = 0.001f;
+            global_rms_s   = 0.0f;
+            novelty_mean   = 0.0f; novelty_m2 = 0.0f;
+            last_sec_tick  = xTaskGetTickCount();
         }
 
-        /* Wait up to 50 ms for a full FFT block */
+        /* ---- Wait for PCM frame (up to 50 ms) ---- */
         size_t got = xStreamBufferReceive(s_pcm_stream, pcm_buf,
                                           FFT_SIZE * sizeof(float),
                                           pdMS_TO_TICKS(50));
-
         TickType_t now = xTaskGetTickCount();
 
         if (got < FFT_SIZE * sizeof(float)) {
-            /* Idle — fade toward black following beat phase */
-            uint32_t ms = (uint32_t)(pdTICKS_TO_MS(now - last_beat_tick));
-            float phase = (float)ms / (float)beat_period_ms;
-            if (phase > 1.5f) phase = 1.5f;
-            float v = rms_display * AMBIENT_FACTOR * expf(-2.0f * phase);
-            for (int i = 0; i < LED_COUNT; i++) {
-                uint8_t r, g, b;
-                hsv_to_rgb(led_hue[i], 1.0f, v, &r, &g, &b);
-                led_strip_set_pixel(s_led_strip, i, r, g, b);
-            }
+            /* Idle / silence: clear strip and decay state */
+            beat_strength *= 0.7f;
+            global_rms_s  *= 0.9f;
+            led_strip_clear(s_led_strip);
             led_strip_refresh(s_led_strip);
-            rms_display *= 0.85f;
             continue;
         }
 
-        /* --- RMS energy (no FFT needed) --- */
+        /* ---- Global RMS brightness gate ---- */
         float rms_sq = 0.0f;
         for (int i = 0; i < FFT_SIZE; i++) rms_sq += pcm_buf[i] * pcm_buf[i];
         float rms = sqrtf(rms_sq / FFT_SIZE);
-        if (rms > rms_max)  rms_max = rms;
-        rms_max    *= 0.9995f;
-        if (rms_max < 0.001f) rms_max = 0.001f;
-        float rms_norm = rms / rms_max;
-        rms_display = 0.35f * rms_norm + 0.65f * rms_display;
+        global_rms_s = 0.15f * rms + 0.85f * global_rms_s;
+        if (rms > global_peak) global_peak = rms;
+        else                   global_peak *= 0.9997f;
+        if (global_peak < 0.001f) global_peak = 0.001f;
+        float global_norm = global_rms_s / global_peak;
+        if (global_norm > 1.0f) global_norm = 1.0f;
 
-        /* --- FFT --- */
+        /* ---- FFT ---- */
         for (int i = 0; i < FFT_SIZE; i++) {
-            fft_buf[i * 2]     = pcm_buf[i] * hann[i];
+            fft_buf[i * 2]     = pcm_buf[i] * hann_win[i];
             fft_buf[i * 2 + 1] = 0.0f;
         }
         dsps_fft2r_fc32(fft_buf, FFT_SIZE);
         dsps_bit_rev2r_fc32(fft_buf, FFT_SIZE);
 
-        /* --- Single pass over bins: centroid + bass energy + spectral flux --- */
-        float cen_num    = 0.0f, cen_den = 0.0f;
-        float bass_energy = 0.0f;
-        float flux        = 0.0f;
-        float hz_per_bin  = (float)s_sample_rate / FFT_SIZE;
-        int   bass_cutoff = (int)(280.0f / hz_per_bin) + 1;   /* ~280 Hz */
+        /* ---- Band energies + spectral flux (single pass) ---- */
+        float hz_per_bin = (float)s_sample_rate / FFT_SIZE;
+        float flux = 0.0f;
+        float band_count[NUM_BANDS] = {0};
+        memset(band_energy, 0, sizeof(band_energy));
 
         for (int k = 1; k < FFT_SIZE / 2; k++) {
-            float re  = fft_buf[k * 2];
-            float im  = fft_buf[k * 2 + 1];
+            float re  = fft_buf[k * 2], im = fft_buf[k * 2 + 1];
             float mag = sqrtf(re * re + im * im);
-            float hz  = k * hz_per_bin;
 
-            cen_num += hz  * mag;
-            cen_den +=        mag;
-
-            if (k <= bass_cutoff) bass_energy += mag;
-
-            float delta = mag - prev_mag[k];
-            if (delta > 0.0f) flux += delta;
+            float d = mag - prev_mag[k];
+            if (d > 0.0f) flux += d;
             prev_mag[k] = mag;
-        }
-        if (bass_cutoff > 0) bass_energy /= bass_cutoff;
 
-        /* Centroid: very slow update — tracks song mood, not individual notes.
-         * Maps CENTROID_LO_HZ–CENTROID_HI_HZ → [0, 1] → hue [0°, HUE_RANGE°] */
-        if (cen_den > 1.0f) {
-            float hz = cen_num / cen_den;
-            float cn = (hz - CENTROID_LO_HZ) / (CENTROID_HI_HZ - CENTROID_LO_HZ);
-            if (cn < 0.0f) cn = 0.0f;
-            if (cn > 1.0f) cn = 1.0f;
-            centroid_norm = 0.985f * centroid_norm + 0.015f * cn;
+            float hz = k * hz_per_bin;
+            for (int b = 0; b < NUM_BANDS; b++) {
+                if (hz >= BAND_HZ[b] && hz < BAND_HZ[b + 1]) {
+                    band_energy[b] += mag;
+                    band_count[b]  += 1.0f;
+                    break;
+                }
+            }
         }
 
-        /* --- Beat detection: bass energy OR spectral flux spike --- */
-        bass_avg = 0.05f * bass_energy + 0.95f * bass_avg;
-        flux_avg = 0.05f * flux        + 0.95f * flux_avg;
+        /* Per-band AGC normalisation */
+        for (int b = 0; b < NUM_BANDS; b++) {
+            if (band_count[b] > 0.0f) band_energy[b] /= band_count[b];
+            if (band_energy[b] > band_peak[b]) band_peak[b] = band_energy[b];
+            else                               band_peak[b] *= BAND_AGC_DECAY;
+            if (band_peak[b] < BAND_AGC_MIN)   band_peak[b]  = BAND_AGC_MIN;
+            band_norm[b] = band_energy[b] / band_peak[b];
+        }
 
-        bool beat = (now - last_beat_tick) > pdMS_TO_TICKS(BEAT_MIN_GAP_MS) &&
-                    (bass_energy > bass_avg * BEAT_RATIO ||
-                     flux        > flux_avg * BEAT_FLUX_RATIO);
+        /* ---- Beat detection — flux with stddev-adaptive threshold ---- */
+        float fd = flux - flux_mean;
+        flux_mean += 0.05f * fd;
+        flux_m2    = 0.95f * flux_m2 + 0.05f * fd * fd;
+        float flux_std = (flux_m2 > 0.0f) ? sqrtf(flux_m2) : 0.0f;
+
+        bool beat = (pdTICKS_TO_MS(now - last_beat_tick) > BEAT_MIN_GAP_MS) &&
+                    (flux > flux_mean + BEAT_K * flux_std)                   &&
+                    (flux > 0.001f);
 
         if (beat) {
-            uint32_t interval = (uint32_t)(pdTICKS_TO_MS(now - last_beat_tick));
-            /* Update beat period estimate only for musically plausible intervals */
-            if (interval > 250 && interval < 1500) {
+            uint32_t interval = (uint32_t)pdTICKS_TO_MS(now - last_beat_tick);
+            if (interval > 250 && interval < 1500)
                 beat_period_ms = (beat_period_ms * 7 + interval) >> 3;
-            }
             last_beat_tick = now;
-            /* Reshuffle hues in arc centred on current mood colour */
-            shuffle_hues_mood(led_hue, centroid_norm * HUE_RANGE);
+            beat_strength  = 1.0f;
+            /* Disco snap: jump hue_offset 40–100° so all LED colors shift
+             * to new positions on the beat — "lights between LEDs changing" */
+            hue_offset = fmodf(hue_offset + 40.0f + (float)(esp_random() % 60), 360.0f);
         }
-
-        /* --- Beat phase: 0.0 at beat → 1.0 at expected next beat --- */
-        uint32_t ms_since = (uint32_t)(pdTICKS_TO_MS(now - last_beat_tick));
-        float phase = (float)ms_since / (float)beat_period_ms;
+        /* Beat-phase exponential decay */
+        float phase = (float)pdTICKS_TO_MS(now - last_beat_tick) / (float)beat_period_ms;
         if (phase > 1.0f) phase = 1.0f;
+        beat_strength = expf(-BEAT_DECAY_K * phase);
 
-        /* --- Brightness: beat flash decays exponentially, ambient from RMS ---
-         *   At phase=0 (beat):  beat_v=1.0  →  v nearly 1.0, sat near-white
-         *   At phase=0.5:       beat_v≈0.08 →  mostly ambient colour glow
-         *   At phase=1.0:       beat_v≈0.007 → just ambient, waiting for beat  */
-        float beat_v  = expf(-BEAT_DECAY_K * phase);
-        float ambient = rms_display * AMBIENT_FACTOR;
-        float v       = ambient + beat_v * (1.0f - ambient);
-        if (v > 1.0f) v = 1.0f;
-
-        /* Saturation: 0 (white) at beat instant, rapidly recovers to full colour */
-        float sat = 1.0f - beat_v * (1.0f - FLASH_SAT_MIN);
-
-        /* --- Render --- */
-        for (int i = 0; i < LED_COUNT; i++) {
-            uint8_t r, g, b;
-            hsv_to_rgb(led_hue[i], sat, v, &r, &g, &b);
-            led_strip_set_pixel(s_led_strip, i, r, g, b);
+        /* ---- Section change — cosine novelty on band_norm vector ---- */
+        float dot = 0.0f, mag_a = 0.0f, mag_b = 0.0f;
+        for (int b = 0; b < NUM_BANDS; b++) {
+            dot   += band_norm[b] * smooth_vec[b];
+            mag_a += band_norm[b] * band_norm[b];
+            mag_b += smooth_vec[b] * smooth_vec[b];
         }
+        float novelty = 0.0f;
+        if (mag_a > 0.0001f && mag_b > 0.0001f)
+            novelty = 1.0f - dot / (sqrtf(mag_a) * sqrtf(mag_b));
+
+        /* Slowly update reference vector */
+        for (int b = 0; b < NUM_BANDS; b++)
+            smooth_vec[b] += NOVELTY_SMOOTH * (band_norm[b] - smooth_vec[b]);
+
+        /* Running stats on novelty for adaptive threshold */
+        float nd = novelty - novelty_mean;
+        novelty_mean += 0.01f * nd;
+        novelty_m2    = 0.99f * novelty_m2 + 0.01f * nd * nd;
+        float novelty_std = (novelty_m2 > 0.0f) ? sqrtf(novelty_m2) : 0.0f;
+
+        if (pdTICKS_TO_MS(now - last_sec_tick) > NOVELTY_MIN_GAP_MS &&
+            novelty > novelty_mean + NOVELTY_K * novelty_std          &&
+            novelty > 0.05f) {
+            last_sec_tick = now;
+            palette_idx   = (palette_idx + 1) % NUM_PALETTES;
+            ESP_LOGI(TAG, "Section change → palette %d", palette_idx);
+        }
+
+        /* ---- Palette + ambient rotation speed (BPM-relative) ---- */
+        float bpm       = 60000.0f / (float)beat_period_ms;
+        float pal_start = PALETTES[palette_idx].start;
+        float pal_range = PALETTES[palette_idx].range;
+        hue_offset = fmodf(hue_offset + 0.5f * (bpm / 120.0f), 360.0f);
+
+        /* ==== Layer 1: Ambient base (palette spread + rotation) ==== */
+        float amb_v = AMBIENT_BASE * global_norm;
+        for (int i = 0; i < LED_COUNT; i++) {
+            float hue = fmodf(pal_start + hue_offset +
+                              pal_range * i / (LED_COUNT - 1), 360.0f);
+            hsv_to_rgb(hue, 1.0f, amb_v, &r_buf[i], &g_buf[i], &b_buf[i]);
+        }
+
+        /* ==== Layer 2: Beat pulse (additive white flash) ==== */
+        uint8_t beat_add = (uint8_t)(beat_strength * BEAT_FLASH_PEAK * 255.0f);
+        if (beat_add > 0) {
+            for (int i = 0; i < LED_COUNT; i++) {
+                r_buf[i] = clamp8((int)r_buf[i] + beat_add);
+                g_buf[i] = clamp8((int)g_buf[i] + beat_add);
+                b_buf[i] = clamp8((int)b_buf[i] + beat_add);
+            }
+        }
+
+        /* ==== Layer 3: Bass wave (warm Gaussian blob drifting along strip) ==== */
+        float bass_level = (band_norm[0] + band_norm[1]) * 0.5f * global_norm;
+        wave_pos = fmodf(wave_pos + 0.1f + band_norm[0] * 0.4f, (float)LED_COUNT);
+        float wave_hue = fmodf(pal_start + 15.0f, 360.0f);
+        for (int i = 0; i < LED_COUNT; i++) {
+            float dist = fabsf((float)i - wave_pos);
+            if (dist > LED_COUNT * 0.5f) dist = LED_COUNT - dist;  /* wrap */
+            float glow = bass_level * BASS_WAVE_PEAK * expf(-0.25f * dist * dist);
+            if (glow < 0.01f) continue;
+            uint8_t r, g, b;
+            hsv_to_rgb(wave_hue, 0.85f, glow, &r, &g, &b);
+            r_buf[i] = clamp8((int)r_buf[i] + r);
+            g_buf[i] = clamp8((int)g_buf[i] + g);
+            b_buf[i] = clamp8((int)b_buf[i] + b);
+        }
+
+        /* ==== Layer 4: Sparkles (upper-band energy) ==== */
+        float upper = (band_norm[4] + band_norm[5] + band_norm[6] + band_norm[7]) * 0.25f;
+        if (upper > SPARKLE_THRESHOLD && global_norm > 0.1f && (esp_random() % 4 == 0)) {
+            for (int s = 0; s < MAX_SPARKLES; s++) {
+                if (sparkles[s].bright < 0.02f) {
+                    sparkles[s].pos    = (uint8_t)(esp_random() % LED_COUNT);
+                    sparkles[s].hue    = fmodf(pal_start + pal_range * 0.7f +
+                                               (float)(esp_random() % 60) - 30.0f, 360.0f);
+                    sparkles[s].bright = upper * global_norm;
+                    break;
+                }
+            }
+        }
+        for (int s = 0; s < MAX_SPARKLES; s++) {
+            if (sparkles[s].bright > 0.02f) {
+                uint8_t r, g, b;
+                hsv_to_rgb(sparkles[s].hue, 0.5f, sparkles[s].bright, &r, &g, &b);
+                int p = sparkles[s].pos;
+                r_buf[p] = clamp8((int)r_buf[p] + r);
+                g_buf[p] = clamp8((int)g_buf[p] + g);
+                b_buf[p] = clamp8((int)b_buf[p] + b);
+                sparkles[s].bright *= SPARKLE_DECAY;
+            }
+        }
+
+        /* ==== Output ==== */
+        for (int i = 0; i < LED_COUNT; i++)
+            led_strip_set_pixel(s_led_strip, i, r_buf[i], g_buf[i], b_buf[i]);
         led_strip_refresh(s_led_strip);
     }
 }
