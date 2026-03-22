@@ -264,6 +264,8 @@ Working reference: `/workspace/src/beep/` (full ESP-IDF project)
 
 | Use case | Library |
 |----------|---------|
-| ESP-IDF (recommended) | `espressif/esp_codec_dev` from IDF component registry |
+| ESP-IDF codec (recommended) | `espressif/esp_codec_dev` from IDF component registry |
+| MP3 playback | `chmorgan/esp-audio-player` — see `/workspace/knowledge/chmorgan-esp-audio-player.md` |
+| WS2812B LEDs | `espressif/led_strip` (RMT driver) |
 | Arduino | `pschatzmann/arduino-audiokit` (`AUDIOKIT_BOARD 7`) |
 | ESP-IDF / ESP-ADF pipeline | `pipeline_sdcard_mp3_example` with ES8388 board config |
