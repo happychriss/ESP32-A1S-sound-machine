@@ -49,6 +49,12 @@
 #include "esp_dsp.h"
 #include "esp_random.h"
 #include "driver/gpio.h"
+#include "nvs_flash.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_a2dp_api.h"
 
 static const char *TAG = "player";
 
@@ -75,15 +81,20 @@ static const char *TAG = "player";
 #define KEY_NEXT_GPIO   GPIO_NUM_23   /* KEY4 — next track                       */
 #define KEY_VOLD_GPIO   GPIO_NUM_18   /* KEY5 — volume down                      */
 #define KEY_VOLU_GPIO   GPIO_NUM_5    /* KEY6 — volume up                        */
-#define BTN_DEBOUNCE_MS  40
-#define BTN_LOCKOUT_MS  400
-#define VOL_STEP         8            /* volume change per press (0–100 scale)   */
-#define VOL_INIT        70
+#define BTN_DEBOUNCE_MS      40
+#define BTN_LOCKOUT_MS      400
+#define VOL_STEP              8       /* volume change per press (0–100 scale)   */
+#define VOL_INIT             70
+#define KEY_PAUSE_LONG_MS  2000       /* hold KEY1 this long to toggle BT mode   */
+
+/* Bluetooth */
+#define BT_DEVICE_NAME  "ESP32-Player"
+#define BT_PAIRING_MS   30000         /* discoverable window in ms               */
 
 /* ---------- FFT / LED show parameters ---------- */
 #define FFT_SIZE              512
-/* stream buffer holds 8 FFT-blocks worth of mono float samples */
-#define STREAM_BUF_BYTES      (FFT_SIZE * 8 * sizeof(float))
+/* stream buffer holds 4 FFT-blocks worth of mono float samples */
+#define STREAM_BUF_BYTES      (FFT_SIZE * 4 * sizeof(float))
 
 /* 8 logarithmic frequency bands */
 #define NUM_BANDS             8
@@ -149,6 +160,200 @@ static volatile bool s_is_paused = false;     /* pause state flag         */
 static SemaphoreHandle_t s_resume_sem;        /* given by KEY1 to resume  */
 /* set by player_event_cb on PLAYING — LED task uses it to reset gain + hues */
 static volatile bool s_track_started = false;
+
+/* Bluetooth state */
+static volatile bool       s_bt_mode            = false; /* in BT audio mode        */
+static volatile bool       s_bt_pairing         = false; /* discoverable window open */
+static volatile bool       s_bt_connected       = false; /* A2DP link up             */
+static volatile TickType_t s_pairing_start_tick = 0;
+static esp_bd_addr_t       s_bt_peer_addr;               /* last connected peer      */
+
+/* BT→I2S decoupling: A2DP callback fills this, bt_audio_task drains to codec.
+ * Prevents blocking the BT task on I2S DMA waits (which drops the link).    */
+static StreamBufferHandle_t s_bt_i2s_stream;
+#define BT_I2S_BUF_BYTES  (8 * 1024)    /* ~45 ms at 44100 Hz stereo 16-bit */
+
+/* Set false on STARTED/STOPPED; bt_audio_task sets true + unmutes PA on first
+ * real data frame — prevents stale-DMA blurp between connect and first play. */
+static volatile bool s_bt_audio_active = false;
+
+/* ------------------------------------------------------------------ */
+/*  Bluetooth A2DP sink                                                 */
+/* ------------------------------------------------------------------ */
+
+/* A2DP data callback — runs in BT task context (time-critical).
+ * Must NOT block on I2S DMA — push to buffers with timeout=0 and return fast. */
+static void a2dp_data_cb(const uint8_t *buf, uint32_t len)
+{
+    if (!s_bt_mode) return;
+
+    /* Push raw PCM to I2S write task (non-blocking — never stall BT timing) */
+    if (s_bt_i2s_stream)
+        xStreamBufferSend(s_bt_i2s_stream, buf, len, 0);
+
+    /* Push mono-float to LED stream buffer for the visualiser */
+    if (s_pcm_stream) {
+        const int16_t *src    = (const int16_t *)buf;
+        int            frames = (int)(len / 4);
+        float          chunk[64];
+        for (int f = 0; f < frames; ) {
+            int n = frames - f;
+            if (n > 64) n = 64;
+            for (int j = 0; j < n; j++) {
+                int idx  = (f + j) * 2;
+                chunk[j] = (src[idx] + src[idx + 1]) * (1.0f / 65536.0f);
+            }
+            xStreamBufferSend(s_pcm_stream, chunk, n * sizeof(float), 0);
+            f += n;
+        }
+    }
+}
+
+/* BT audio write task — drains s_bt_i2s_stream to codec on Core 1.
+ * Keeps I2S DMA waits out of the BT task completely.
+ * Unmutes the PA on the first real data frame to avoid blurp noise. */
+static void bt_audio_task(void *arg)
+{
+    static uint8_t i2s_buf[1024];
+    while (1) {
+        if (!s_bt_mode || !s_bt_i2s_stream) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        size_t got = xStreamBufferReceive(s_bt_i2s_stream, i2s_buf,
+                                          sizeof(i2s_buf), pdMS_TO_TICKS(100));
+        if (got > 0) {
+            if (!s_bt_audio_active) {
+                s_bt_audio_active = true;
+                gpio_set_level(PA_ENABLE_PIN, 1);   /* unmute on first real frame */
+            }
+            esp_codec_dev_write(s_play_dev, i2s_buf, (int)got);
+        }
+    }
+}
+
+/* A2DP connection / audio-state events */
+static void a2dp_event_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p)
+{
+    switch (event) {
+    case ESP_A2D_CONNECTION_STATE_EVT:
+        if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            memcpy(s_bt_peer_addr, p->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
+            s_bt_connected = true;
+            s_bt_pairing   = false;   /* stop blinking, show LED music show */
+            ESP_LOGI(TAG, "BT A2DP connected");
+        } else if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            s_bt_connected = false;
+            if (s_bt_mode) {
+                s_bt_mode = false;    /* phone hung up → return to SD */
+                ESP_LOGI(TAG, "BT disconnected → SD mode");
+            }
+        }
+        break;
+    case ESP_A2D_AUDIO_STATE_EVT:
+        if (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED) {
+            s_track_started = true;
+            if (s_bt_i2s_stream) xStreamBufferReset(s_bt_i2s_stream);
+            s_bt_audio_active = false;  /* bt_audio_task unmutes on first frame */
+            ESP_LOGI(TAG, "BT audio started");
+        } else if (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STOPPED) {
+            s_bt_audio_active = false;
+            gpio_set_level(PA_ENABLE_PIN, 0);
+        }
+        break;
+    case ESP_A2D_AUDIO_CFG_EVT:
+        /* Reconfigure codec for negotiated sample rate.
+         * SBC CIE byte 0 sampling-frequency bits are a one-hot bitmask:
+         *   bit7=16k  bit6=32k  bit5=44.1k  bit4=48k                  */
+        if (p->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
+            uint8_t sf = p->audio_cfg.mcc.cie.sbc[0];
+            int rate;
+            if      (sf & (1 << 5)) rate = 44100;
+            else if (sf & (1 << 4)) rate = 48000;
+            else if (sf & (1 << 6)) rate = 32000;
+            else                    rate = 16000;
+            ESP_LOGI(TAG, "BT SBC rate: %d Hz", rate);
+            s_sample_rate = rate;
+            esp_codec_dev_close(s_play_dev);
+            esp_codec_dev_sample_info_t fs = {
+                .sample_rate = rate, .channel = 2, .bits_per_sample = 16
+            };
+            esp_codec_dev_open(s_play_dev, &fs);
+            /* esp_codec_dev_open re-enables pa_pin — force mute;
+             * bt_audio_task will unmute when first audio frame arrives */
+            gpio_set_level(PA_ENABLE_PIN, 0);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* GAP callback — auto-confirm SSP (Just Works, no PIN display needed) */
+static void gap_event_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *p)
+{
+    switch (event) {
+    case ESP_BT_GAP_CFM_REQ_EVT:
+        esp_bt_gap_ssp_confirm_reply(p->cfm_req.bda, true);
+        break;
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        if (p->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS)
+            ESP_LOGI(TAG, "BT paired: %s", p->auth_cmpl.device_name);
+        else
+            ESP_LOGW(TAG, "BT auth failed: %d", p->auth_cmpl.stat);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Enter BT pairing mode — call from button_task */
+static void bt_enter_pairing(void)
+{
+    ESP_LOGI(TAG, "BT pairing mode — %d s window", BT_PAIRING_MS / 1000);
+    gpio_set_level(PA_ENABLE_PIN, 0);     /* mute amp — silence MP3 flush tail */
+    s_bt_mode            = true;
+    s_bt_pairing         = true;
+    s_pairing_start_tick = xTaskGetTickCount();
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+}
+
+/* Exit BT mode — call from button_task or timeout handler */
+static void bt_exit_mode(void)
+{
+    ESP_LOGI(TAG, "BT mode off → SD");
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    if (s_bt_connected)
+        esp_a2d_sink_disconnect(s_bt_peer_addr);
+    s_bt_pairing   = false;
+    s_bt_connected = false;
+    s_bt_mode      = false;   /* main loop sees this and restarts SD */
+}
+
+/* One-time BT stack init — call after audio_init() */
+static void bt_init(void)
+{
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+
+    /* IO capability: no input/no output → "Just Works" SSP, no PIN needed */
+    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
+    esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(iocap));
+
+    ESP_ERROR_CHECK(esp_bt_gap_register_callback(gap_event_cb));
+    ESP_ERROR_CHECK(esp_a2d_register_callback(a2dp_event_cb));
+    ESP_ERROR_CHECK(esp_a2d_sink_register_data_callback(a2dp_data_cb));
+    ESP_ERROR_CHECK(esp_a2d_sink_init());
+
+    esp_bt_gap_set_device_name(BT_DEVICE_NAME);
+    /* Start non-discoverable; long-press KEY1 enables pairing */
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+
+    ESP_LOGI(TAG, "BT A2DP sink ready — long-press KEY1 (2 s) to pair");
+}
 
 /* ------------------------------------------------------------------ */
 /*  LED show helpers                                                    */
@@ -227,6 +432,17 @@ static void led_task(void *arg)
     float      wave_pos      = 0.0f;   /* bass blob position     */
 
     while (1) {
+
+        /* ---- BT pairing mode: all LEDs blink blue, skip audio analysis ---- */
+        if (s_bt_pairing) {
+            uint32_t ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
+            uint8_t  v  = ((ms / 500u) & 1u) ? 0u : 40u;   /* 1 Hz blink */
+            for (int i = 0; i < LED_COUNT; i++)
+                led_strip_set_pixel(s_led_strip, i, 0, 0, v);
+            led_strip_refresh(s_led_strip);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
 
         /* ---- New track: full state reset ---- */
         if (s_track_started) {
@@ -470,73 +686,85 @@ static void button_task(void *arg)
     };
     gpio_config(&nav_io);
 
-    int  pause_stable = 0;
-    int  prev_stable  = 0;
-    int  next_stable  = 0;
-    int  vold_stable  = 0;
-    int  volu_stable  = 0;
+    int  pause_stable    = 0;
+    bool pause_long_done = false;
+    int  prev_stable     = 0;
+    int  next_stable     = 0;
+    int  vold_stable     = 0;
+    int  volu_stable     = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        /* --- PAUSE/RESUME key (KEY1, GPIO36) ---
-         * Pause:  mute amp → stop player → main loop blocks on s_resume_sem.
-         * Resume: unblock main loop → main loop replays same track → codec
-         *         re-opens and unmutes amp automatically via player_event_cb. */
-        if (gpio_get_level(KEY_PAUSE_GPIO) == 0) { pause_stable++; } else { pause_stable = 0; }
-        if (pause_stable == 2) {
-            pause_stable = 99;
-            if (!s_is_paused) {
-                gpio_set_level(PA_ENABLE_PIN, 0);   /* silence amp immediately  */
-                vTaskDelay(pdMS_TO_TICKS(20));
-                s_is_paused = true;
-                audio_player_stop();                /* IDLE fires → s_track_done */
-                ESP_LOGI(TAG, "KEY PAUSE → paused");
-            } else {
-                s_is_paused = false;
-                xSemaphoreGive(s_resume_sem);       /* wake main loop to replay  */
-                ESP_LOGI(TAG, "KEY PAUSE → resumed");
+        /* --- BT pairing window timeout --- */
+        if (s_bt_pairing && !s_bt_connected) {
+            if (pdTICKS_TO_MS(xTaskGetTickCount() - s_pairing_start_tick) >= BT_PAIRING_MS) {
+                ESP_LOGI(TAG, "BT pairing timeout — back to SD");
+                bt_exit_mode();
             }
-            vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
-            pause_stable = 0;
         }
 
-        /* --- PREV key (KEY3) --- */
+        /* --- KEY1 (GPIO36): short = pause/resume, long (2 s) = BT mode toggle --- */
+        if (gpio_get_level(KEY_PAUSE_GPIO) == 0) {
+            pause_stable++;
+            if (pause_stable == (KEY_PAUSE_LONG_MS / 20) && !pause_long_done) {
+                pause_long_done = true;
+                if (!s_bt_mode) {
+                    bt_enter_pairing();
+                    if (s_is_paused) { s_is_paused = false; xSemaphoreGive(s_resume_sem); }
+                    else             { audio_player_stop(); }
+                } else {
+                    bt_exit_mode();
+                }
+                ESP_LOGI(TAG, "KEY1 long → BT %s", s_bt_mode ? "ON" : "OFF");
+                vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
+            }
+        } else {
+            if (pause_stable >= 2 && !pause_long_done && !s_bt_mode) {
+                if (!s_is_paused) {
+                    gpio_set_level(PA_ENABLE_PIN, 0);
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                    s_is_paused = true;
+                    audio_player_stop();
+                    ESP_LOGI(TAG, "KEY PAUSE → paused");
+                } else {
+                    s_is_paused = false;
+                    xSemaphoreGive(s_resume_sem);
+                    ESP_LOGI(TAG, "KEY PAUSE → resumed");
+                }
+                vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
+            }
+            pause_stable    = 0;
+            pause_long_done = false;
+        }
+
+        /* --- PREV key (KEY3) — SD mode only --- */
         if (gpio_get_level(KEY_PREV_GPIO) == 0) { prev_stable++; } else { prev_stable = 0; }
-        if (prev_stable == 2) {
+        if (prev_stable == 2 && !s_bt_mode) {
             prev_stable = 99;
             int target = (s_track_idx - 1 + s_track_count) % s_track_count;
             s_next_track_override = target;
             ESP_LOGI(TAG, "KEY PREV → track %d", target + 1);
-            if (s_is_paused) {
-                /* Already stopped — just unblock main loop */
-                s_is_paused = false;
-                xSemaphoreGive(s_resume_sem);
-            } else {
-                audio_player_stop();
-            }
+            if (s_is_paused) { s_is_paused = false; xSemaphoreGive(s_resume_sem); }
+            else              { audio_player_stop(); }
             vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
             prev_stable = 0;
         }
 
-        /* --- NEXT key (KEY4) --- */
+        /* --- NEXT key (KEY4) — SD mode only --- */
         if (gpio_get_level(KEY_NEXT_GPIO) == 0) { next_stable++; } else { next_stable = 0; }
-        if (next_stable == 2) {
+        if (next_stable == 2 && !s_bt_mode) {
             next_stable = 99;
             int target = (s_track_idx + 1) % s_track_count;
             s_next_track_override = target;
             ESP_LOGI(TAG, "KEY NEXT → track %d", target + 1);
-            if (s_is_paused) {
-                s_is_paused = false;
-                xSemaphoreGive(s_resume_sem);
-            } else {
-                audio_player_stop();
-            }
+            if (s_is_paused) { s_is_paused = false; xSemaphoreGive(s_resume_sem); }
+            else              { audio_player_stop(); }
             vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
             next_stable = 0;
         }
 
-        /* --- VOL DOWN key (KEY5) --- */
+        /* --- VOL DOWN key (KEY5) — works in both modes --- */
         if (gpio_get_level(KEY_VOLD_GPIO) == 0) { vold_stable++; } else { vold_stable = 0; }
         if (vold_stable == 2) {
             vold_stable = 99;
@@ -548,7 +776,7 @@ static void button_task(void *arg)
             vold_stable = 0;
         }
 
-        /* --- VOL UP key (KEY6) --- */
+        /* --- VOL UP key (KEY6) — works in both modes --- */
         if (gpio_get_level(KEY_VOLU_GPIO) == 0) { volu_stable++; } else { volu_stable = 0; }
         if (volu_stable == 2) {
             volu_stable = 99;
@@ -795,6 +1023,14 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32-Audio-Kit MP3 player + LED spectrum analyzer");
 
+    /* NVS required by BT stack for bonding info */
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
     /* SD must mount before I2S init (GPIO25/26 conflict) */
     sd_init();
     scan_mp3();
@@ -821,10 +1057,14 @@ void app_main(void)
                                        FFT_SIZE * sizeof(float));
     assert(s_pcm_stream);
 
+    /* BT→I2S decoupling buffer — drained by bt_audio_task on Core 1 */
+    s_bt_i2s_stream = xStreamBufferCreate(BT_I2S_BUF_BYTES, 512);
+    assert(s_bt_i2s_stream);
+
     audio_init();
 
     /* LED show task on core 0, priority below audio decode (5) */
-    xTaskCreatePinnedToCore(led_task, "led_fft", 12288, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(led_task, "led_fft", 3072, NULL, 3, NULL, 0);
 
     s_track_done = xSemaphoreCreateBinary();
     assert(s_track_done);
@@ -842,12 +1082,22 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_player_new(ap_cfg));
     audio_player_callback_register(player_event_cb, NULL);
 
+    bt_init();
+
     ESP_LOGI(TAG, "Starting playlist (%d tracks)", s_track_count);
+
+    /* BT audio write task on Core 1 (same core as MP3 decode, away from BT stack) */
+    xTaskCreatePinnedToCore(bt_audio_task, "bt_audio", 2048, NULL, 4, NULL, 1);
 
     /* Button task on core 0, lowest priority */
     xTaskCreatePinnedToCore(button_task, "buttons", 2048, NULL, 2, NULL, 0);
 
     while (1) {
+        /* ---- BT mode: A2DP data callback drives audio, spin here ---- */
+        while (s_bt_mode) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
         const char *path = s_tracks[s_track_idx];
         ESP_LOGI(TAG, "Playing [%d/%d]: %s",
                  s_track_idx + 1, s_track_count, path);

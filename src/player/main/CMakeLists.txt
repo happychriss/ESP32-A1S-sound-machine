@@ -6,6 +6,8 @@ idf_component_register(
         fatfs
         log
         esp_timer
+        nvs_flash
+        bt
         espressif__esp_codec_dev
         chmorgan__esp-audio-player
         espressif__led_strip
