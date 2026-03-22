@@ -36,18 +36,19 @@ Plays a 1 kHz sine tone on the left speaker JST jack in a continuous loop. Used 
 
 ---
 
-### 2. SD card MP3 player
+### 2. SD card MP3 player with LED spectrum + keys
 
-**Status:** Complete (step 1) / Not started (step 2 — LED)
+**Status:** Complete
 **Source:** `/workspace/src/player/`
 
 **Description:**
-Plays all `.mp3` files found on an SD card in a loop. Step 2 will add a WS2812B LED equalizer (30 LEDs, GPIO22) driven by FFT analysis of the PCM stream.
+Plays all `.mp3` files found on an SD card in a loop. WS2812B 30-LED spectrum analyzer driven by FFT of the PCM stream. KEY3/KEY4 navigate previous/next track.
 
 **Requirements:**
 - Read all `.mp3` files from SD card root, loop forever
 - Clean audio output via ES8388 (same codec init as beep)
-- Step 2: WS2812B LED bar visualizer, equalizer / disco effect
+- WS2812B LED spectrum analyzer, 30 LEDs, GPIO22
+- KEY3 (GPIO19) = previous track, KEY4 (GPIO23) = next track
 
 **Implementation notes:**
 - SD must mount before I2S init — GPIO25/26 conflict during init sequence
@@ -55,6 +56,11 @@ Plays all `.mp3` files found on an SD card in a loop. Step 2 will add a WS2812B 
 - `chmorgan/esp-audio-player` (1.1.0) + `chmorgan/esp-libhelix-mp3` — handles MP3 decode, sample-rate switching via `clk_set_fn`, `force_stereo=true` for mono files
 - `clk_set_fn` signature: `(uint32_t rate, uint32_t bits, i2s_slot_mode_t ch)` — NOT `uint32_t ch`
 - Library calls `fclose()` on the FILE* when done — caller must not close it
-- PCM write callback (`i2s_write_cb`) is the tap point for step 2 FFT
-- `espressif/led_strip` (3.0.3) already in `idf_component.yml`, LED_GPIO=GPIO22 defined, stub TODO in `i2s_write_cb`
-- Audio decode task pinned to core 1
+- `espressif/esp-dsp` (1.7.1) for 512-point FFT: `dsps_fft2r_init_fc32`, `dsps_fft2r_fc32`, `dsps_bit_rev2r_fc32`, `dsps_wind_hann_f32`
+- PCM tap in `i2s_write_cb`: stereo int16 downmixed to mono float, pushed to `xStreamBuffer`
+- LED task on core 0 (priority 3): reads FFT_SIZE floats, applies Hann window, FFT, log-compress, asymmetric smooth, beat detection, HSV render
+- Audio decode task pinned to core 1 (priority 5)
+- KEY1/GPIO36 unusable — input-only, no internal pull-up; KEY2/GPIO13 unusable — SD conflict
+- KEY3 (GPIO19) and KEY4 (GPIO23) confirmed working: active LOW, internal pull-up, 40 ms debounce
+- `audio_player_stop()` triggers IDLE callback → semaphore → main loop picks up `s_next_track_override`
+- Button task on core 0 (priority 2), polls at 20 ms, 400 ms lockout after press

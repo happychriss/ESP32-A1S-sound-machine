@@ -23,6 +23,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.0.3
+  espressif/esp-dsp:
+    component_hash: 939e9c053487d6e7b7320a5cb761b2200e4b331730d6721668755ef76ab9f067
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.1
   espressif/esp_codec_dev:
     component_hash: 0d9e9bc288156eb55f79338d312e1ebf8c9dfbd5e7d13ef0f20ccb031b4e15cf
     dependencies:
@@ -49,9 +59,10 @@ dependencies:
     version: 5.5.3
 direct_dependencies:
 - chmorgan/esp-audio-player
+- espressif/esp-dsp
 - espressif/esp_codec_dev
 - espressif/led_strip
 - idf
-manifest_hash: 0c0c57da958915ae1f6ff539b1c3a652148d8d03ff55ee0567a59fd1cd3dfd61
+manifest_hash: e257802510f4a80632f166c6fa6a38308d990e0e2d2f77b3887f5687e988ac92
 target: esp32
 version: 2.0.0

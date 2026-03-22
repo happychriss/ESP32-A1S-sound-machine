@@ -165,16 +165,20 @@ gpio_set_level(GPIO_NUM_21, 1);
 
 ---
 
-## Buttons — KEY1–KEY6 (# unconfirmed — from arduino-audiokit community)
+## Buttons — KEY1–KEY6
 
-| Button | GPIO |
-|--------|------|
-| KEY1 | GPIO36 |
-| KEY2 | GPIO13 (conflicts with SD CS) |
-| KEY3 | GPIO19 |
-| KEY4 | GPIO23 |
-| KEY5 | GPIO18 |
-| KEY6 | GPIO5 |
+| Button | GPIO | Status |
+|--------|------|--------|
+| KEY1 | GPIO36 | **Unusable** — input-only pin, no internal pull-up, floats |
+| KEY2 | GPIO13 | **Unusable** — conflicts with SD D3 |
+| KEY3 | GPIO19 | **Confirmed working** — active LOW, internal pull-up, reliable |
+| KEY4 | GPIO23 | **Confirmed working** — active LOW, internal pull-up, reliable |
+| KEY5 | GPIO18 | Available — normal GPIO, untested |
+| KEY6 | GPIO5  | Available — normal GPIO, untested (strapping pin, fine at runtime) |
+
+Confirmed pattern: active LOW (button shorts to GND), configure with `GPIO_PULLUP_ENABLE`.
+Debounce: 2 × 20 ms poll = 40 ms stable. Lockout: 400 ms after action.
+`audio_player_stop()` is available in chmorgan/esp-audio-player and triggers IDLE callback.
 
 ---
 

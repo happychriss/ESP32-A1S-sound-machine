@@ -4,3 +4,4 @@ dependencies:
   espressif/esp_codec_dev: '*'
   chmorgan/esp-audio-player: '*'
   espressif/led_strip: '*'
+  espressif/esp-dsp: '*'
