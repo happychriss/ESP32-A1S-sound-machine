@@ -42,13 +42,14 @@ Plays a 1 kHz sine tone on the left speaker JST jack in a continuous loop. Used 
 **Source:** `/workspace/src/player/`
 
 **Description:**
-Plays all `.mp3` files found on an SD card in a loop. WS2812B 30-LED spectrum analyzer driven by FFT of the PCM stream. KEY3/KEY4 navigate previous/next track.
+Plays all `.mp3` files found on an SD card in a loop. WS2812B 30-LED mood show driven by FFT of the PCM stream. KEY1 pause/resume, KEY3/KEY4 prev/next, KEY5/KEY6 volume.
 
 **Requirements:**
 - Read all `.mp3` files from SD card root, loop forever
 - Clean audio output via ES8388 (same codec init as beep)
-- WS2812B LED spectrum analyzer, 30 LEDs, GPIO22
-- KEY3 (GPIO19) = previous track, KEY4 (GPIO23) = next track
+- WS2812B LED mood show, 30 LEDs, GPIO22
+- KEY1 (GPIO36) = pause/resume, KEY3 (GPIO19) = previous, KEY4 (GPIO23) = next
+- KEY5 (GPIO18) = volume down, KEY6 (GPIO5) = volume up
 
 **Implementation notes:**
 - SD must mount before I2S init — GPIO25/26 conflict during init sequence
@@ -58,13 +59,14 @@ Plays all `.mp3` files found on an SD card in a loop. WS2812B 30-LED spectrum an
 - Library calls `fclose()` on the FILE* when done — caller must not close it
 - `espressif/esp-dsp` (1.7.1) for 512-point FFT: `dsps_fft2r_init_fc32`, `dsps_fft2r_fc32`, `dsps_bit_rev2r_fc32`, `dsps_wind_hann_f32`
 - PCM tap in `i2s_write_cb`: stereo int16 downmixed to mono float, pushed to `xStreamBuffer`
-- LED task on core 0 (priority 3): reads FFT_SIZE floats, applies Hann window, FFT, global auto-gain, log-compress, asymmetric smooth (attack α=0.65, decay α=0.22), beat detection, HSV render
-- Colors: all 30 hues evenly distributed across 360°, Fisher-Yates shuffled on every beat (disco effect)
+- LED task on core 0 (priority 3): beat-phase exponential brightness decay, spectral centroid → mood hue, beat detection, Fisher-Yates hue reshuffle on beat
 - Beat detection: bass energy spike (≥1.5× rolling avg) OR spectral flux spike (≥1.8× rolling avg)
-- Fast warmup gain (×0.96/frame) for first 150 frames of each track — fills spectrum within first 1–2 beats
-- Global auto-gain (single running_max) preserves natural dynamics — decay α=0.22 keeps LEDs breathing with rhythm
 - Audio decode task pinned to core 1 (priority 5)
-- KEY1/GPIO36 unusable — input-only, no internal pull-up; KEY2/GPIO13 unusable — SD conflict
-- KEY3 (GPIO19) and KEY4 (GPIO23) confirmed working: active LOW, internal pull-up, 40 ms debounce
-- `audio_player_stop()` triggers IDLE callback → semaphore → main loop picks up `s_next_track_override`
+- KEY1/GPIO36 — input-only pin, no internal pull-up; board external pull-up makes it usable
+- KEY2/GPIO13 unusable — SD D3 conflict
+- KEY3–KEY6: active LOW, internal pull-up, 40 ms debounce, 400 ms lockout
+- Pause: `gpio_set_level(PA_ENABLE_PIN, 0)` → `audio_player_stop()` → main loop blocks on `s_resume_sem`
+- Resume: button clears `s_is_paused` → gives `s_resume_sem` → main loop replays same track
+- Prev/Next while paused: set override + give `s_resume_sem` (no second stop — already stopped)
+- `player_event_cb` PLAYING event: `gpio_set_level(PA_ENABLE_PIN, 1)` unmutes amp on track start
 - Button task on core 0 (priority 2), polls at 20 ms, 400 ms lockout after press

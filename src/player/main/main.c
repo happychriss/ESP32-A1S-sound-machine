@@ -1,18 +1,21 @@
 /*
- * ESP32-Audio-Kit MP3 player + WS2812B LED spectrum analyzer
+ * ESP32-Audio-Kit MP3 player + WS2812B LED mood show
  *
  * SD card → MP3 decode (chmorgan/esp-audio-player) → ES8388 → speaker
- * LED show (GPIO22, 30 LEDs):
- *   - FFT spectrum: 30 bands, red (bass) → violet (treble)
- *   - Fast attack / slow decay smoothing → natural peak-hold feel
- *   - Beat detection from bass bins → white flash overlay
- *   - Auto-gain adapts to track loudness
- *   - Fades to black when idle
+ * LED show (GPIO22, 30 LEDs) — mood-driven, not spectrum:
+ *   - Beat phase drives brightness: full flash at beat, exponential decay to dark
+ *   - Spectral centroid drives colour: bass-heavy → warm (red/orange),
+ *     treble-bright → cool (blue/violet) — changes slowly with song character
+ *   - RMS energy sets ambient floor: quiet passages dim, loud passages glow
+ *   - On each beat: hues reshuffled in a spread around current centroid colour
+ *   - Beat white-flash (saturation drops to near-zero at beat moment)
  *
- * Keys (active LOW, internal pull-up):
- *   KEY3  GPIO19 = Previous track
- *   KEY4  GPIO23 = Next track
- *   (KEY1/GPIO36 skipped — input-only, no pull-up)
+ * Keys (active LOW):
+ *   KEY1  GPIO36 = Pause / Resume (input-only pin, external pull-up on board)
+ *   KEY3  GPIO19 = Previous track  (internal pull-up)
+ *   KEY4  GPIO23 = Next track      (internal pull-up)
+ *   KEY5  GPIO18 = Volume down     (internal pull-up)
+ *   KEY6  GPIO5  = Volume up       (internal pull-up)
  *   (KEY2/GPIO13 skipped — SD D3 conflict)
  *
  * Pins (internal to module):
@@ -64,36 +67,40 @@ static const char *TAG = "player";
 #define LED_COUNT       30
 #define MOUNT_POINT     "/sdcard"
 
-/* Keys — active LOW, internal pull-up, 40 ms debounce, 400 ms lockout */
-#define KEY_PREV_GPIO   GPIO_NUM_19   /* KEY3 — previous track */
-#define KEY_NEXT_GPIO   GPIO_NUM_23   /* KEY4 — next track     */
+/* Keys — active LOW, 40 ms debounce, 400 ms lockout
+ * KEY1/GPIO36: input-only, NO internal pull-up (relies on board external pull-up)
+ * KEY3–KEY6:   normal GPIOs with internal pull-up                               */
+#define KEY_PAUSE_GPIO  GPIO_NUM_36   /* KEY1 — pause / resume (input-only pin)  */
+#define KEY_PREV_GPIO   GPIO_NUM_19   /* KEY3 — previous track                   */
+#define KEY_NEXT_GPIO   GPIO_NUM_23   /* KEY4 — next track                       */
+#define KEY_VOLD_GPIO   GPIO_NUM_18   /* KEY5 — volume down                      */
+#define KEY_VOLU_GPIO   GPIO_NUM_5    /* KEY6 — volume up                        */
 #define BTN_DEBOUNCE_MS  40
 #define BTN_LOCKOUT_MS  400
+#define VOL_STEP         8            /* volume change per press (0–100 scale)   */
+#define VOL_INIT        70
 
-/* ---------- FFT / LED show parameters ---------- */
+/* ---------- FFT / LED mood show parameters ---------- */
 #define FFT_SIZE            512
 /* stream buffer holds 8 FFT-blocks worth of mono float samples */
 #define STREAM_BUF_BYTES    (FFT_SIZE * 8 * sizeof(float))
 
-/* frequency range mapped to the 30 LEDs */
-#define FREQ_LO_HZ          40.0f
-#define FREQ_HI_HZ          8000.0f
+/* spectral centroid → mood hue mapping */
+#define CENTROID_LO_HZ      300.0f  /* below this = full bass → hue 0 (red)  */
+#define CENTROID_HI_HZ     5000.0f  /* above this = full treble → hue HUE_RANGE */
+#define HUE_RANGE           240.0f  /* red (0°) → blue/violet (240°)          */
+#define HUE_SPREAD          160.0f  /* hue arc spread around centroid per beat */
 
-/* smoothing: fast attack so peaks register instantly, slow decay for peak-hold feel */
-#define ATTACK_ALPHA        0.65f
-#define DECAY_ALPHA         0.22f   /* faster drop-off → more rhythmic breathing */
+/* beat-phase brightness */
+#define BEAT_DECAY_K          5.0f  /* higher = darker between beats (more blinky) */
+#define AMBIENT_FACTOR        0.20f /* max ambient brightness from RMS energy   */
+#define FLASH_SAT_MIN         0.08f /* saturation at beat moment (near-white)   */
 
 /* beat detection */
-#define BEAT_BASS_LEDS      8       /* use first N LEDs (bass) for energy beat */
-#define BEAT_RATIO          1.5f    /* bass spike threshold: rolling avg × this */
-#define BEAT_FLUX_RATIO     1.8f    /* spectral-flux threshold: rolling avg × this */
-#define BEAT_MIN_GAP_MS     200
-#define BEAT_FLASH_FRAMES   8
-
-/* per-band auto-gain */
-#define GAIN_DECAY_NORMAL   0.999f  /* slow decay during steady state */
-#define GAIN_DECAY_WARMUP   0.960f  /* fast decay for first ~3 s of each track */
-#define GAIN_WARMUP_FRAMES  150     /* ~3 s at ~50 fps */
+#define BEAT_RATIO            1.5f  /* bass energy spike: rolling avg × this    */
+#define BEAT_FLUX_RATIO       1.8f  /* spectral flux spike: rolling avg × this  */
+#define BEAT_MIN_GAP_MS       220   /* minimum ms between beats (~273 BPM max)  */
+#define BEAT_PERIOD_INIT_MS   550   /* starting estimate ~109 BPM               */
 
 /* ---------- globals ---------- */
 static i2s_chan_handle_t        s_i2s_tx;
@@ -111,6 +118,9 @@ static int  s_track_idx   = 0;
 
 /* button → main-loop track override (-1 = normal advance) */
 static volatile int  s_next_track_override = -1;
+static int           s_volume    = VOL_INIT;  /* current volume 0–100    */
+static volatile bool s_is_paused = false;     /* pause state flag         */
+static SemaphoreHandle_t s_resume_sem;        /* given by KEY1 to resume  */
 /* set by player_event_cb on PLAYING — LED task uses it to reset gain + hues */
 static volatile bool s_track_started = false;
 
@@ -140,36 +150,17 @@ static void hsv_to_rgb(float h, float s, float v,
     *b = (uint8_t)((b1 + m) * 255.0f);
 }
 
-/* Assign all 30 hues evenly across the color wheel, then Fisher-Yates shuffle.
- * This guarantees every hue appears exactly once — full disco spectrum. */
-static void shuffle_hues(float *hues)
+/* Spread LED_COUNT hues evenly across HUE_SPREAD degrees centred on hue_base,
+ * then Fisher-Yates shuffle — every LED gets a distinct hue in the mood palette. */
+static void shuffle_hues_mood(float *hues, float hue_base)
 {
+    float start = hue_base - HUE_SPREAD / 2.0f;
     for (int i = 0; i < LED_COUNT; i++) {
-        hues[i] = (360.0f / LED_COUNT) * i;
+        hues[i] = fmodf(start + (HUE_SPREAD / (LED_COUNT - 1)) * i + 360.0f, 360.0f);
     }
     for (int i = LED_COUNT - 1; i > 0; i--) {
         int j = (int)(esp_random() % (i + 1));
         float tmp = hues[i]; hues[i] = hues[j]; hues[j] = tmp;
-    }
-}
-
-/* Build logarithmic frequency→bin map for the current sample rate */
-static void init_led_bins(uint32_t sample_rate,
-                          int bin_start[], int bin_end[])
-{
-    float hz_per_bin = (float)sample_rate / FFT_SIZE;
-    for (int i = 0; i < LED_COUNT; i++) {
-        float f_lo = FREQ_LO_HZ * powf(FREQ_HI_HZ / FREQ_LO_HZ,
-                                        (float)i       / LED_COUNT);
-        float f_hi = FREQ_LO_HZ * powf(FREQ_HI_HZ / FREQ_LO_HZ,
-                                        (float)(i + 1) / LED_COUNT);
-        int b_lo = (int)(f_lo / hz_per_bin);
-        int b_hi = (int)(f_hi / hz_per_bin) + 1;
-        if (b_lo < 1)                 b_lo = 1;             /* skip DC */
-        if (b_hi > FFT_SIZE / 2 - 1) b_hi = FFT_SIZE / 2 - 1;
-        if (b_hi <= b_lo)             b_hi = b_lo + 1;
-        bin_start[i] = b_lo;
-        bin_end[i]   = b_hi;
     }
 }
 
@@ -179,70 +170,76 @@ static void init_led_bins(uint32_t sample_rate,
 
 static void led_task(void *arg)
 {
-    /* Work buffers in BSS (not on task stack) */
-    static float fft_buf[FFT_SIZE * 2];   /* complex interleaved */
+    /* Work buffers in BSS */
+    static float fft_buf[FFT_SIZE * 2];      /* complex interleaved          */
     static float pcm_buf[FFT_SIZE];
     static float hann[FFT_SIZE];
-    static int   bin_start[LED_COUNT];
-    static int   bin_end[LED_COUNT];
-    static float display[LED_COUNT];      /* smoothed per-band brightness */
-    static float prev_norm[LED_COUNT];    /* previous frame norms for spectral flux */
-    static float led_hue[LED_COUNT];      /* randomised hue per LED — reshuffled on beat */
+    static float prev_mag[FFT_SIZE / 2];     /* for spectral flux            */
+    static float led_hue[LED_COUNT];         /* hue per LED, mood-shuffled   */
 
     ESP_ERROR_CHECK(dsps_fft2r_init_fc32(NULL, FFT_SIZE));
     dsps_wind_hann_f32(hann, FFT_SIZE);
 
-    uint32_t cur_rate = s_sample_rate;
-    init_led_bins(cur_rate, bin_start, bin_end);
+    /* Start with a neutral mid-spectrum mood (green-ish) */
+    float centroid_norm  = 0.5f;
+    shuffle_hues_mood(led_hue, centroid_norm * HUE_RANGE);
 
-    memset(display,   0, sizeof(display));
-    memset(prev_norm, 0, sizeof(prev_norm));
-    shuffle_hues(led_hue);
-
-    float      running_max = 1.0f;
-    float      bass_avg    = 0.0f;
-    float      flux_avg    = 0.0f;
-    int        beat_flash  = 0;
-    int        warmup      = GAIN_WARMUP_FRAMES;
-    TickType_t last_beat   = 0;
+    float      rms_display    = 0.0f;
+    float      rms_max        = 0.001f;
+    float      bass_avg       = 0.0f;
+    float      flux_avg       = 0.0f;
+    uint32_t   beat_period_ms = BEAT_PERIOD_INIT_MS;
+    TickType_t last_beat_tick = 0;
+    memset(prev_mag, 0, sizeof(prev_mag));
 
     while (1) {
-        /* Adapt bin map if sample rate changed mid-playlist */
-        uint32_t new_rate = s_sample_rate;
-        if (new_rate != cur_rate) {
-            cur_rate = new_rate;
-            init_led_bins(cur_rate, bin_start, bin_end);
-        }
 
-        /* New track started — reset gain, beat state, hues */
+        /* New track → reset all state */
         if (s_track_started) {
-            s_track_started = false;
-            running_max = 1.0f;
-            memset(display,   0, sizeof(display));
-            memset(prev_norm, 0, sizeof(prev_norm));
-            bass_avg   = 0.0f;
-            flux_avg   = 0.0f;
-            beat_flash = 0;
-            warmup     = GAIN_WARMUP_FRAMES;
-            shuffle_hues(led_hue);
+            s_track_started  = false;
+            centroid_norm    = 0.5f;
+            rms_display      = 0.0f;
+            rms_max          = 0.001f;
+            bass_avg         = 0.0f;
+            flux_avg         = 0.0f;
+            beat_period_ms   = BEAT_PERIOD_INIT_MS;
+            last_beat_tick   = xTaskGetTickCount();
+            memset(prev_mag, 0, sizeof(prev_mag));
+            shuffle_hues_mood(led_hue, centroid_norm * HUE_RANGE);
         }
 
-        /* Wait up to 50 ms for a full FFT block of PCM */
+        /* Wait up to 50 ms for a full FFT block */
         size_t got = xStreamBufferReceive(s_pcm_stream, pcm_buf,
                                           FFT_SIZE * sizeof(float),
                                           pdMS_TO_TICKS(50));
 
+        TickType_t now = xTaskGetTickCount();
+
         if (got < FFT_SIZE * sizeof(float)) {
-            /* No audio — graceful fade to black */
+            /* Idle — fade toward black following beat phase */
+            uint32_t ms = (uint32_t)(pdTICKS_TO_MS(now - last_beat_tick));
+            float phase = (float)ms / (float)beat_period_ms;
+            if (phase > 1.5f) phase = 1.5f;
+            float v = rms_display * AMBIENT_FACTOR * expf(-2.0f * phase);
             for (int i = 0; i < LED_COUNT; i++) {
-                display[i] *= 0.85f;
                 uint8_t r, g, b;
-                hsv_to_rgb(led_hue[i], 1.0f, display[i], &r, &g, &b);
+                hsv_to_rgb(led_hue[i], 1.0f, v, &r, &g, &b);
                 led_strip_set_pixel(s_led_strip, i, r, g, b);
             }
             led_strip_refresh(s_led_strip);
+            rms_display *= 0.85f;
             continue;
         }
+
+        /* --- RMS energy (no FFT needed) --- */
+        float rms_sq = 0.0f;
+        for (int i = 0; i < FFT_SIZE; i++) rms_sq += pcm_buf[i] * pcm_buf[i];
+        float rms = sqrtf(rms_sq / FFT_SIZE);
+        if (rms > rms_max)  rms_max = rms;
+        rms_max    *= 0.9995f;
+        if (rms_max < 0.001f) rms_max = 0.001f;
+        float rms_norm = rms / rms_max;
+        rms_display = 0.35f * rms_norm + 0.65f * rms_display;
 
         /* --- FFT --- */
         for (int i = 0; i < FFT_SIZE; i++) {
@@ -252,89 +249,80 @@ static void led_task(void *arg)
         dsps_fft2r_fc32(fft_buf, FFT_SIZE);
         dsps_bit_rev2r_fc32(fft_buf, FFT_SIZE);
 
-        /* --- Magnitude per LED band --- */
-        float new_mag[LED_COUNT];
-        for (int led = 0; led < LED_COUNT; led++) {
-            float sum = 0.0f;
-            int   cnt = bin_end[led] - bin_start[led];
-            for (int k = bin_start[led]; k < bin_end[led]; k++) {
-                float re = fft_buf[k * 2];
-                float im = fft_buf[k * 2 + 1];
-                sum += sqrtf(re * re + im * im);
-            }
-            new_mag[led] = cnt > 0 ? sum / cnt : 0.0f;
-        }
-
-        /* --- Global auto-gain: single peak tracks the loudest band.
-         *     Warmup uses fast decay so the display fills within the first beat.
-         *     After warmup, slow decay preserves calibration across the track. */
-        float gain_decay = (warmup > 0) ? GAIN_DECAY_WARMUP : GAIN_DECAY_NORMAL;
-        if (warmup > 0) warmup--;
-
-        for (int i = 0; i < LED_COUNT; i++) {
-            if (new_mag[i] > running_max) running_max = new_mag[i];
-        }
-        running_max *= gain_decay;
-        if (running_max < 1.0f) running_max = 1.0f;
-
-        float norm[LED_COUNT];
-        for (int i = 0; i < LED_COUNT; i++) {
-            float n = new_mag[i] / running_max;
-            norm[i] = log10f(1.0f + 9.0f * n);   /* perceptual log compression */
-        }
-
-        /* --- Asymmetric smoothing + collect beat energies --- */
+        /* --- Single pass over bins: centroid + bass energy + spectral flux --- */
+        float cen_num    = 0.0f, cen_den = 0.0f;
         float bass_energy = 0.0f;
         float flux        = 0.0f;
-        for (int i = 0; i < LED_COUNT; i++) {
-            float alpha = (norm[i] > display[i]) ? ATTACK_ALPHA : DECAY_ALPHA;
-            display[i]  = alpha * norm[i] + (1.0f - alpha) * display[i];
+        float hz_per_bin  = (float)s_sample_rate / FFT_SIZE;
+        int   bass_cutoff = (int)(280.0f / hz_per_bin) + 1;   /* ~280 Hz */
 
-            if (i < BEAT_BASS_LEDS) bass_energy += display[i];
+        for (int k = 1; k < FFT_SIZE / 2; k++) {
+            float re  = fft_buf[k * 2];
+            float im  = fft_buf[k * 2 + 1];
+            float mag = sqrtf(re * re + im * im);
+            float hz  = k * hz_per_bin;
 
-            /* spectral flux: sum of positive energy increases across all bands */
-            float delta = norm[i] - prev_norm[i];
+            cen_num += hz  * mag;
+            cen_den +=        mag;
+
+            if (k <= bass_cutoff) bass_energy += mag;
+
+            float delta = mag - prev_mag[k];
             if (delta > 0.0f) flux += delta;
-            prev_norm[i] = norm[i];
+            prev_mag[k] = mag;
         }
-        bass_energy /= BEAT_BASS_LEDS;
+        if (bass_cutoff > 0) bass_energy /= bass_cutoff;
 
-        /* --- Beat detection: bass energy spike OR spectral flux spike --- */
+        /* Centroid: very slow update — tracks song mood, not individual notes.
+         * Maps CENTROID_LO_HZ–CENTROID_HI_HZ → [0, 1] → hue [0°, HUE_RANGE°] */
+        if (cen_den > 1.0f) {
+            float hz = cen_num / cen_den;
+            float cn = (hz - CENTROID_LO_HZ) / (CENTROID_HI_HZ - CENTROID_LO_HZ);
+            if (cn < 0.0f) cn = 0.0f;
+            if (cn > 1.0f) cn = 1.0f;
+            centroid_norm = 0.985f * centroid_norm + 0.015f * cn;
+        }
+
+        /* --- Beat detection: bass energy OR spectral flux spike --- */
         bass_avg = 0.05f * bass_energy + 0.95f * bass_avg;
         flux_avg = 0.05f * flux        + 0.95f * flux_avg;
 
-        TickType_t now = xTaskGetTickCount();
-        bool beat = (now - last_beat) > pdMS_TO_TICKS(BEAT_MIN_GAP_MS) &&
+        bool beat = (now - last_beat_tick) > pdMS_TO_TICKS(BEAT_MIN_GAP_MS) &&
                     (bass_energy > bass_avg * BEAT_RATIO ||
                      flux        > flux_avg * BEAT_FLUX_RATIO);
 
         if (beat) {
-            beat_flash = BEAT_FLASH_FRAMES;
-            last_beat  = now;
-            shuffle_hues(led_hue);   /* disco: randomise colour positions on beat */
+            uint32_t interval = (uint32_t)(pdTICKS_TO_MS(now - last_beat_tick));
+            /* Update beat period estimate only for musically plausible intervals */
+            if (interval > 250 && interval < 1500) {
+                beat_period_ms = (beat_period_ms * 7 + interval) >> 3;
+            }
+            last_beat_tick = now;
+            /* Reshuffle hues in arc centred on current mood colour */
+            shuffle_hues_mood(led_hue, centroid_norm * HUE_RANGE);
         }
 
-        float beat_add = (beat_flash > 0)
-                         ? (float)beat_flash / BEAT_FLASH_FRAMES
-                         : 0.0f;
-        if (beat_flash > 0) beat_flash--;
+        /* --- Beat phase: 0.0 at beat → 1.0 at expected next beat --- */
+        uint32_t ms_since = (uint32_t)(pdTICKS_TO_MS(now - last_beat_tick));
+        float phase = (float)ms_since / (float)beat_period_ms;
+        if (phase > 1.0f) phase = 1.0f;
 
-        /* --- Render — each LED has its own randomly assigned hue --- */
+        /* --- Brightness: beat flash decays exponentially, ambient from RMS ---
+         *   At phase=0 (beat):  beat_v=1.0  →  v nearly 1.0, sat near-white
+         *   At phase=0.5:       beat_v≈0.08 →  mostly ambient colour glow
+         *   At phase=1.0:       beat_v≈0.007 → just ambient, waiting for beat  */
+        float beat_v  = expf(-BEAT_DECAY_K * phase);
+        float ambient = rms_display * AMBIENT_FACTOR;
+        float v       = ambient + beat_v * (1.0f - ambient);
+        if (v > 1.0f) v = 1.0f;
+
+        /* Saturation: 0 (white) at beat instant, rapidly recovers to full colour */
+        float sat = 1.0f - beat_v * (1.0f - FLASH_SAT_MIN);
+
+        /* --- Render --- */
         for (int i = 0; i < LED_COUNT; i++) {
-            float v = display[i];
-            if (v < 0.0f) v = 0.0f;
-            if (v > 1.0f) v = 1.0f;
-
             uint8_t r, g, b;
-            hsv_to_rgb(led_hue[i], 1.0f, v, &r, &g, &b);
-
-            if (beat_add > 0.0f) {
-                float w = beat_add * 0.75f;
-                r = (uint8_t)(r + (uint8_t)((255 - r) * w));
-                g = (uint8_t)(g + (uint8_t)((255 - g) * w));
-                b = (uint8_t)(b + (uint8_t)((255 - b) * w));
-            }
-
+            hsv_to_rgb(led_hue[i], sat, v, &r, &g, &b);
             led_strip_set_pixel(s_led_strip, i, r, g, b);
         }
         led_strip_refresh(s_led_strip);
@@ -349,52 +337,115 @@ static void led_task(void *arg)
 
 static void button_task(void *arg)
 {
-    /* Configure both keys: input, pull-up, no interrupt */
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << KEY_PREV_GPIO) | (1ULL << KEY_NEXT_GPIO),
+    /* KEY1 (GPIO36) — input-only pin, board has external pull-up, no internal */
+    gpio_config_t pause_io = {
+        .pin_bit_mask = (1ULL << KEY_PAUSE_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pause_io);
+
+    /* KEY3–KEY6 — normal GPIOs with internal pull-up */
+    gpio_config_t nav_io = {
+        .pin_bit_mask = (1ULL << KEY_PREV_GPIO) | (1ULL << KEY_NEXT_GPIO) |
+                        (1ULL << KEY_VOLD_GPIO) | (1ULL << KEY_VOLU_GPIO),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io);
+    gpio_config(&nav_io);
 
-    int prev_stable = 0;   /* consecutive LOW count for PREV key */
-    int next_stable = 0;   /* consecutive LOW count for NEXT key */
+    int  pause_stable = 0;
+    int  prev_stable  = 0;
+    int  next_stable  = 0;
+    int  vold_stable  = 0;
+    int  volu_stable  = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        /* --- PREV key --- */
-        if (gpio_get_level(KEY_PREV_GPIO) == 0) {
-            prev_stable++;
-        } else {
-            prev_stable = 0;
+        /* --- PAUSE/RESUME key (KEY1, GPIO36) ---
+         * Pause:  mute amp → stop player → main loop blocks on s_resume_sem.
+         * Resume: unblock main loop → main loop replays same track → codec
+         *         re-opens and unmutes amp automatically via player_event_cb. */
+        if (gpio_get_level(KEY_PAUSE_GPIO) == 0) { pause_stable++; } else { pause_stable = 0; }
+        if (pause_stable == 2) {
+            pause_stable = 99;
+            if (!s_is_paused) {
+                gpio_set_level(PA_ENABLE_PIN, 0);   /* silence amp immediately  */
+                vTaskDelay(pdMS_TO_TICKS(20));
+                s_is_paused = true;
+                audio_player_stop();                /* IDLE fires → s_track_done */
+                ESP_LOGI(TAG, "KEY PAUSE → paused");
+            } else {
+                s_is_paused = false;
+                xSemaphoreGive(s_resume_sem);       /* wake main loop to replay  */
+                ESP_LOGI(TAG, "KEY PAUSE → resumed");
+            }
+            vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
+            pause_stable = 0;
         }
-        if (prev_stable == 2) {   /* just became stable-LOW */
-            prev_stable = 99;     /* saturate so we don't re-trigger */
+
+        /* --- PREV key (KEY3) --- */
+        if (gpio_get_level(KEY_PREV_GPIO) == 0) { prev_stable++; } else { prev_stable = 0; }
+        if (prev_stable == 2) {
+            prev_stable = 99;
             int target = (s_track_idx - 1 + s_track_count) % s_track_count;
             s_next_track_override = target;
             ESP_LOGI(TAG, "KEY PREV → track %d", target + 1);
-            audio_player_stop();
+            if (s_is_paused) {
+                /* Already stopped — just unblock main loop */
+                s_is_paused = false;
+                xSemaphoreGive(s_resume_sem);
+            } else {
+                audio_player_stop();
+            }
             vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
             prev_stable = 0;
         }
 
-        /* --- NEXT key --- */
-        if (gpio_get_level(KEY_NEXT_GPIO) == 0) {
-            next_stable++;
-        } else {
-            next_stable = 0;
-        }
+        /* --- NEXT key (KEY4) --- */
+        if (gpio_get_level(KEY_NEXT_GPIO) == 0) { next_stable++; } else { next_stable = 0; }
         if (next_stable == 2) {
             next_stable = 99;
             int target = (s_track_idx + 1) % s_track_count;
             s_next_track_override = target;
             ESP_LOGI(TAG, "KEY NEXT → track %d", target + 1);
-            audio_player_stop();
+            if (s_is_paused) {
+                s_is_paused = false;
+                xSemaphoreGive(s_resume_sem);
+            } else {
+                audio_player_stop();
+            }
             vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
             next_stable = 0;
+        }
+
+        /* --- VOL DOWN key (KEY5) --- */
+        if (gpio_get_level(KEY_VOLD_GPIO) == 0) { vold_stable++; } else { vold_stable = 0; }
+        if (vold_stable == 2) {
+            vold_stable = 99;
+            s_volume -= VOL_STEP;
+            if (s_volume < 0) s_volume = 0;
+            esp_codec_dev_set_out_vol(s_play_dev, s_volume);
+            ESP_LOGI(TAG, "KEY VOL- → %d", s_volume);
+            vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
+            vold_stable = 0;
+        }
+
+        /* --- VOL UP key (KEY6) --- */
+        if (gpio_get_level(KEY_VOLU_GPIO) == 0) { volu_stable++; } else { volu_stable = 0; }
+        if (volu_stable == 2) {
+            volu_stable = 99;
+            s_volume += VOL_STEP;
+            if (s_volume > 100) s_volume = 100;
+            esp_codec_dev_set_out_vol(s_play_dev, s_volume);
+            ESP_LOGI(TAG, "KEY VOL+ → %d", s_volume);
+            vTaskDelay(pdMS_TO_TICKS(BTN_LOCKOUT_MS));
+            volu_stable = 0;
         }
     }
 }
@@ -463,7 +514,8 @@ static void player_event_cb(audio_player_cb_ctx_t *ctx)
 {
     switch (ctx->audio_event) {
     case AUDIO_PLAYER_CALLBACK_EVENT_PLAYING:
-        s_track_started = true;   /* LED task resets gain + hues on next frame */
+        s_track_started = true;            /* LED task resets gain + hues       */
+        gpio_set_level(PA_ENABLE_PIN, 1);  /* unmute amp — safe if already on   */
         break;
     case AUDIO_PLAYER_CALLBACK_EVENT_IDLE:
         xSemaphoreGive(s_track_done);
@@ -619,7 +671,7 @@ static void audio_init(void)
         .bits_per_sample = 16,
     };
     ESP_ERROR_CHECK(esp_codec_dev_open(s_play_dev, &fs));
-    esp_codec_dev_set_out_vol(s_play_dev, 70);
+    esp_codec_dev_set_out_vol(s_play_dev, s_volume);
     ESP_LOGI(TAG, "ES8388 ready");
 }
 
@@ -664,6 +716,8 @@ void app_main(void)
 
     s_track_done = xSemaphoreCreateBinary();
     assert(s_track_done);
+    s_resume_sem = xSemaphoreCreateBinary();
+    assert(s_resume_sem);
 
     audio_player_config_t ap_cfg = {
         .mute_fn      = NULL,
@@ -689,19 +743,33 @@ void app_main(void)
         FILE *fp = fopen(path, "rb");
         if (!fp) {
             ESP_LOGE(TAG, "Cannot open %s", path);
-        } else {
-            /* Library owns fclose() when playback ends */
-            audio_player_play(fp);
-            xSemaphoreTake(s_track_done, portMAX_DELAY);
+            s_track_idx = (s_track_idx + 1) % s_track_count;
+            continue;
         }
 
-        /* Check for button-driven track override, else advance normally */
+        /* Library owns fclose() when playback ends */
+        bool was_paused = false;
+        audio_player_play(fp);
+        xSemaphoreTake(s_track_done, portMAX_DELAY);
+
+        /* Paused: block here until KEY1 resume or next/prev override */
+        if (s_is_paused) {
+            was_paused = true;
+            xSemaphoreTake(s_resume_sem, portMAX_DELAY);
+            /* s_is_paused is now false — set by button_task before Give */
+        }
+
+        /* Advance track index:
+         *   - next/prev override → jump to that track (works from both states)
+         *   - natural end of track → advance by one
+         *   - pure pause/resume → replay same track (no index change)         */
         int override = s_next_track_override;
         if (override >= 0) {
             s_next_track_override = -1;
             s_track_idx = override;
-        } else {
+        } else if (!was_paused) {
             s_track_idx = (s_track_idx + 1) % s_track_count;
         }
+        /* else: was_paused + no override → replay same track */
     }
 }

@@ -169,16 +169,18 @@ gpio_set_level(GPIO_NUM_21, 1);
 
 | Button | GPIO | Status |
 |--------|------|--------|
-| KEY1 | GPIO36 | **Unusable** — input-only pin, no internal pull-up, floats |
+| KEY1 | GPIO36 | **Usable** — input-only pin, no internal pull-up, but board has external pull-up; configure with `GPIO_PULLUP_DISABLE` |
 | KEY2 | GPIO13 | **Unusable** — conflicts with SD D3 |
 | KEY3 | GPIO19 | **Confirmed working** — active LOW, internal pull-up, reliable |
 | KEY4 | GPIO23 | **Confirmed working** — active LOW, internal pull-up, reliable |
-| KEY5 | GPIO18 | Available — normal GPIO, untested |
-| KEY6 | GPIO5  | Available — normal GPIO, untested (strapping pin, fine at runtime) |
+| KEY5 | GPIO18 | **Confirmed working** — active LOW, internal pull-up, reliable |
+| KEY6 | GPIO5  | **Confirmed working** — active LOW, internal pull-up, reliable (strapping pin, fine at runtime) |
 
-Confirmed pattern: active LOW (button shorts to GND), configure with `GPIO_PULLUP_ENABLE`.
+Confirmed pattern: active LOW (button shorts to GND). KEY3–KEY6: `GPIO_PULLUP_ENABLE`. KEY1: `GPIO_PULLUP_DISABLE` (board external pull-up does the job).
 Debounce: 2 × 20 ms poll = 40 ms stable. Lockout: 400 ms after action.
 `audio_player_stop()` is available in chmorgan/esp-audio-player and triggers IDLE callback.
+
+**Pause pattern** (confirmed working): mute NS4150 amp (`gpio_set_level(PA_ENABLE_PIN, 0)`) → `audio_player_stop()` → main loop blocks on semaphore. Do NOT use `audio_player_pause()` — crashes I2S DMA on this board. Do NOT rely on PA mute alone — LEDs keep running and occasional blurp on unmute.
 
 ---
 
