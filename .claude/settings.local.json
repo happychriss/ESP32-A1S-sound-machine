@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push)",
+      "Bash(ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null && ssh -T git@github-esp-idf-test 2>&1; git push)"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "${localWorkspaceFolderBasename} (Dev Container)",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "ubuntu",
+  "updateRemoteUserUID": true,
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "Anthropic.claude-code"
+      ]
+    }
+  },
+  "forwardPorts": [],
+  "mounts": [
+    "source=devcontainer-commandhistory,target=/commandhistory,type=volume"
+  ]
+}

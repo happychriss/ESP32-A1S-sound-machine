@@ -1,0 +1,54 @@
+# =============================================================================
+# Credentials & Secrets — never commit
+# =============================================================================
+claude-config/.credentials.json
+.env
+.env.*
+!.env.example
+.env.local
+*.secret
+*.pem
+*.key
+
+# =============================================================================
+# Claude runtime state — session-specific, not reproducible config
+# =============================================================================
+claude-config/history.jsonl
+claude-config/file-history/
+claude-config/cache/
+claude-config/projects/
+claude-config/session-env
+claude-config/shell-snapshots/
+claude-config/debug/
+claude-config/ide/
+claude-config/backups/
+
+# Plugin marketplaces are cloned git repos — not our content
+claude-config/plugins/marketplaces/
+
+# =============================================================================
+# ESP-IDF build output
+# =============================================================================
+src/*/build/
+# fetched by idf component manager on build — like node_modules
+src/*/managed_components/
+# generated from sdkconfig.defaults — reproducible, not committed
+src/*/sdkconfig
+src/*/.cache/
+
+# =============================================================================
+# Local cloned repos (keep template repo clean)
+# =============================================================================
+projects/
+repos/
+
+# =============================================================================
+# General
+# =============================================================================
+*.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# local backup of template git history
+template-history.bundle

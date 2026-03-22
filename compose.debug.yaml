@@ -1,0 +1,6 @@
+services:
+  app:
+    image: ${COMPOSE_PROJECT_NAME:-app}
+    build:
+      context: .
+      dockerfile: ./Dockerfile
