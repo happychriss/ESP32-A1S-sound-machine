@@ -59,8 +59,11 @@ Plays all `.mp3` files found on an SD card in a loop. WS2812B 30-LED mood show d
 - Library calls `fclose()` on the FILE* when done — caller must not close it
 - `espressif/esp-dsp` (1.7.1) for 512-point FFT: `dsps_fft2r_init_fc32`, `dsps_fft2r_fc32`, `dsps_bit_rev2r_fc32`, `dsps_wind_hann_f32`
 - PCM tap in `i2s_write_cb`: stereo int16 downmixed to mono float, pushed to `xStreamBuffer`
-- LED task on core 0 (priority 3): beat-phase exponential brightness decay, spectral centroid → mood hue, beat detection, Fisher-Yates hue reshuffle on beat
-- Beat detection: bass energy spike (≥1.5× rolling avg) OR spectral flux spike (≥1.8× rolling avg)
+- LED task on core 0 (priority 3): 4-layer composited show — ambient palette rotation + beat pulse + bass blob + sparkles
+- 8 log bands (60 Hz–20 kHz), per-band AGC (τ~10 s) × global RMS gate
+- Beat detection: spectral flux > flux_mean + 1.2 × flux_std (adaptive stddev threshold)
+- Section change: cosine novelty on 8-band vectors → palette cycle (5 palettes, min 5 s gap)
+- Disco snap: hue_offset jumps 40–100° on every beat → all LED colors shift to new positions
 - Audio decode task pinned to core 1 (priority 5)
 - KEY1/GPIO36 — input-only pin, no internal pull-up; board external pull-up makes it usable
 - KEY2/GPIO13 unusable — SD D3 conflict
