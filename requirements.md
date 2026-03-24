@@ -75,11 +75,15 @@ Plays all `.mp3` files found on an SD card in a loop. Long-press KEY1 (2 s) swit
 **Implementation notes — LED show:**
 - `espressif/esp-dsp` (1.7.1), 512-point FFT with Hann window
 - PCM tap in both `i2s_write_cb` (SD) and `a2dp_data_cb` (BT): stereo int16 → mono float → `xStreamBuffer`
-- LED task core 0 (priority 3): 4-layer composited show — ambient palette rotation + beat pulse + bass blob + sparkles
+- LED task core 0 (priority 3): 5-layer composited show — ambient + beat burst + bass blob + sparkles + picture frame
 - 8 log bands (60 Hz–20 kHz), per-band AGC (τ~10 s) × global RMS gate
-- Beat detection: spectral flux > flux_mean + 1.2×flux_std
-- Section change: cosine novelty → palette cycle (5 palettes, min 5 s gap)
-- Disco snap: hue_offset jumps 40–100° on every beat
+- Beat detection: dual-EMA sub-bass ratio — `kick_fast / kick_slow > KICK_RATIO (1.3)`, 200 ms min gap
+- Strobe gate: `beat_strength < 0.04` → `led_strip_clear` (true off between beats); frame layer always visible at dim level
+- No-blank fix: stream-dry path holds last frame (no `led_strip_clear`) — prevents DMA-timing flicker
+- `side_hues[4]`: random hues regenerated on each disco snap with ~80–120° forced separation; bottom/right/top/left each get a distinct color every beat
+- `vol_tier` (0=quiet, 1=mid, 2=loud): drives saturation (0.45/0.80/1.00) and frame visibility (1 pair / alternating / all 4 sides)
+- Section change: cosine novelty detection still active (logs only, no palette cycle — palettes removed)
+- `AMBIENT_BASE 0.06`, `BEAT_FLASH_PEAK 1.0`, `BEAT_DECAY_K 10`, `DISCO_SNAP_GAP_MS 350`
 
 **Implementation notes — buttons:**
 - KEY1/GPIO36: input-only pin, no internal pull-up; board external pull-up. Long-press = 100 polls × 20 ms
