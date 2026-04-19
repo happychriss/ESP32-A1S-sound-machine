@@ -50,6 +50,7 @@ Plays all `.mp3` files found on an SD card in a loop. Long-press KEY1 (2 s) swit
 - Bluetooth A2DP sink: long-press KEY1 enters 30 s pairing window (LEDs blink blue), phone connects via SSP "Just Works", audio streams through codec with LED show
 - WS2812B LED mood show, 30 LEDs, GPIO22
 - KEY1 (GPIO36) short = pause/resume, long (2 s) = BT mode toggle
+- Bluetooth device name: `Dietmars-Soundbox`
 - KEY3 (GPIO19) = previous, KEY4 (GPIO23) = next, KEY5 (GPIO18) = vol down, KEY6 (GPIO5) = vol up
 
 **Implementation notes — SD/MP3:**
@@ -61,6 +62,10 @@ Plays all `.mp3` files found on an SD card in a loop. Long-press KEY1 (2 s) swit
 - Pause: `gpio_set_level(PA_ENABLE_PIN, 0)` → `audio_player_stop()` → main loop blocks on `s_resume_sem`
 - Resume: button gives `s_resume_sem` → main loop replays same track → PLAYING → PA unmuted
 - Never use `audio_player_pause()` — crashes I2S DMA on this board
+- Playlist is sorted alphabetically by filename (`qsort` + `strcmp`) so play order is controlled by naming; `_welcome.mp3` plays first (underscore sorts before letters)
+- **Component patch strategy**: `managed_components/` is gitignored (like node_modules). Patches to `chmorgan__esp-audio-player` live in `src/player/components/chmorgan__esp-audio-player/` (tracked); ESP-IDF prefers `components/` over `managed_components/`
+- **ID3 seek fix** (`audio_mp3.cpp` / `is_mp3()`): when ID3v2 header detected, decode the syncsafe size and `fseek` past the entire tag before returning — prevents Helix decoder from scanning hundreds of KB of embedded JPEG cover art, which starved the I2S DMA and caused crackling at the start of every song with cover art
+- **nChans guard** (`audio_mp3.cpp` / `decode_mp3()`): after `MP3Decode` succeeds, check `frame_info.nChans == 0` and return `DECODE_STATUS_NO_DATA_CONTINUE` — prevents `IntegerDivideByZero` crash when JPEG binary inside an ID3 tag is misdetected as a valid MP3 frame
 
 **Implementation notes — Bluetooth:**
 - `CONFIG_BT_BLE_ENABLED=n` required — without it `btm_ble_init` asserts on boot even with `BTDM_CTRL_MODE_BR_EDR_ONLY=y`

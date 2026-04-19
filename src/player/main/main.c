@@ -38,6 +38,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <math.h>
@@ -99,7 +100,7 @@ static const char *TAG = "player";
 #define KEY_PAUSE_LONG_MS  2000       /* hold KEY1 this long to toggle BT mode   */
 
 /* Bluetooth */
-#define BT_DEVICE_NAME  "ESP32-Player"
+#define BT_DEVICE_NAME  "Dietmars-Soundbox"
 #define BT_PAIRING_MS   30000         /* discoverable window in ms               */
 
 /* ---------- FFT / LED show parameters ---------- */
@@ -1184,6 +1185,13 @@ static void scan_mp3(void)
         }
     }
     closedir(dir);
+
+    /* Sort playlist alphabetically so track order on card matches filename order */
+    if (s_track_count > 1) {
+        qsort(s_tracks, s_track_count, sizeof(s_tracks[0]),
+              (int (*)(const void *, const void *))strcmp);
+    }
+
     ESP_LOGI(TAG, "Found %d MP3 files", s_track_count);
 }
 

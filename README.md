@@ -1,3 +1,18 @@
+# Dietmars-Soundbox — ESP32 Audio Player
+
+SD card MP3 player + Bluetooth A2DP sink with WS2812B LED mood show, running on an Ai-Thinker ESP32-Audio-Kit (ESP32-A1S V2.2, ES8388 codec).
+
+**Features:**
+- Plays all `.mp3` files from SD card root in alphabetical filename order; `_welcome.mp3` always plays first
+- KEY1 short-press = pause/resume; long-press (2 s) = toggle Bluetooth A2DP sink mode
+- KEY3/KEY4 = prev/next track; KEY5/KEY6 = volume down/up
+- BT device name: **Dietmars-Soundbox** — phone streams audio via SBC with the same LED show
+- 30-LED WS2812B strip on GPIO22: 5-layer composited show (ambient + beat burst + bass blob + sparkles + picture frame), 8-band FFT with per-band AGC and beat detection
+
+**Source:** `src/player/` — see `requirements.md` for full spec and implementation notes.
+
+---
+
 # Claude Code devcontainer template
 
 This repo is structured to work out-of-the-box with VS Code **Dev Containers** using the custom root [docker-compose.yml](docker-compose.yml) service `dev`.
